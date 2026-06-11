@@ -1,8 +1,10 @@
 """
-通信资源联合分配调度器 — 优化版（<200ms）
+通信资源联合分配调度器（<200ms, 多策略优化）
 """
 import sys
 import math
+import time
+import random
 
 
 def lin2db(x):
@@ -58,9 +60,7 @@ def parse_input(lines):
 def allocate_beams(P, T, beamMaxNum, CAP, N, RES_SUB):
     beam_alloc = {t: [] for t in range(1, T + 1)}
     res_counts = {t: len(RES_SUB[t]) for t in range(1, T + 1)}
-    beam_scores = []
-    for b in range(P):
-        beam_scores.append((sum(CAP[i][b] for i in range(1, N + 1)), b + 1))
+    beam_scores = [(sum(CAP[i][b] for i in range(1, N + 1)), b + 1) for b in range(P)]
     beam_scores.sort(reverse=True)
     allocated = 0
     for t in range(1, T + 1):
@@ -83,18 +83,17 @@ def allocate_beams(P, T, beamMaxNum, CAP, N, RES_SUB):
 
 
 def compute_fse(user, n_users, sub_band, beam_alloc, CAP, SINR):
-    """与旧代码完全一致的 fse 计算"""
     sinr = SINR.get(user, 0)
     share_penalty = lin2db(1.0 / max(1, n_users))
     beams = beam_alloc.get(sub_band, [])
     cap_with = sum(CAP[user][b - 1] for b in beams)
     cap_all = sum(CAP[user])
-    beam_gain = lin2db(cap_with) - lin2db(cap_all)
-    return sinr + share_penalty + beam_gain
+    return sinr + share_penalty + lin2db(cap_with) - lin2db(cap_all)
 
 
-def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
-    """贪心分配，与旧代码一致"""
+def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc,
+                    user_order):
+    """贪心分配：按给定顺序处理用户，每个用户选最佳资源"""
     mu_to_group = {}
     for g_idx, group in enumerate(MU):
         for u in group:
@@ -104,21 +103,14 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
     resources = {}
     for t in range(1, T + 1):
         for rid in RES_SUB[t]:
-            resources[(t, rid)] = [None, set()]  # [mu_group, users_set]
-
-    user_priority = []
-    for u in range(1, N + 1):
-        if buffer[u] <= 0:
-            continue
-        tc = sum(CAP[u])
-        sinr_lin = 10 ** (max(-10, min(30, SINR[u])) / 10)
-        user_priority.append((buffer[u] * tc * sinr_lin, u))
-    user_priority.sort(reverse=True)
+            resources[(t, rid)] = [None, set()]
 
     assignments = {u: [] for u in range(1, N + 1)}
     su_used = set()
 
-    for _, user in user_priority:
+    for user in user_order:
+        if buffer.get(user, 0) <= 0:
+            continue
         best_fse = -1e9
         best_res = None
         for (t, rid), (group, users) in resources.items():
@@ -130,7 +122,6 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
                     continue
             candidate = users | {user}
             n_after = len(candidate)
-
             if user in su_set:
                 if n_after > 1:
                     continue
@@ -140,12 +131,10 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
                     continue
                 if any(mu_to_group.get(cu, g) != g for cu in candidate if cu in mu_to_group):
                     continue
-
             fse = compute_fse(user, n_after, t, beam_alloc, CAP, SINR)
             if cap_lookup(fse) > 0 and fse > best_fse:
                 best_fse = fse
                 best_res = (t, rid)
-
         if best_res is not None:
             t, rid = best_res
             assignments[user].append(best_res)
@@ -155,7 +144,6 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
             elif user in mu_to_group:
                 resources[(t, rid)][0] = mu_to_group[user]
 
-    # Compute initial T
     res_to_users = {}
     for u, res_list in assignments.items():
         for sub, rid in res_list:
@@ -163,18 +151,37 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
             if key not in res_to_users:
                 res_to_users[key] = set()
             res_to_users[key].add(u)
-
     return assignments, resources, res_to_users, su_used
 
 
-def fast_improve(assignments, resources, res_to_users, su_used, beam_alloc,
-                 CAP, SINR, buffer, RES_SUB, N, T, MU, SU, max_iter=3000):
-    """快速局部改进：增量维护 user_tran_cache + res_to_users"""
+def fast_improve(assignments, res_to_users, su_used, beam_alloc,
+                 CAP, SINR, buffer, RES_SUB, N, T, MU, SU):
+    """快速增量改进（预计算 base_fse 加速）"""
     mu_to_group = {}
     for g_idx, group in enumerate(MU):
         for u in group:
             mu_to_group[u] = g_idx
     su_set = set(SU)
+
+    # Precompute base_fse[u][t] = SINR + beam_gain (without sharing penalty)
+    base_fse = {}
+    for u in range(1, N + 1):
+        base_fse[u] = {}
+        cap_all = sum(CAP[u])
+        for t in range(1, T + 1):
+            beams = beam_alloc.get(t, [])
+            cap_with = sum(CAP[u][b - 1] for b in beams)
+            base_fse[u][t] = SINR[u] + lin2db(cap_with) - lin2db(cap_all)
+
+    def fse_fast(u, t, n_users):
+        return base_fse[u].get(t, -1000) + lin2db(1.0 / max(1, n_users))
+
+    # Precompute cap_lookup table for faster access
+    cap_cache = {}
+    def cap_fast(fse_val):
+        if fse_val not in cap_cache:
+            cap_cache[fse_val] = cap_lookup(fse_val)
+        return cap_cache[fse_val]
 
     user_tran_cache = {}
     for u in range(1, N + 1):
@@ -184,21 +191,19 @@ def fast_improve(assignments, resources, res_to_users, su_used, beam_alloc,
             bc = 0
             for sub, rid in assignments[u]:
                 n = len(res_to_users.get((sub, rid), {u}))
-                bc += cap_lookup(compute_fse(u, n, sub, beam_alloc, CAP, SINR))
+                bc += cap_fast(fse_fast(u, sub, n))
             user_tran_cache[u] = min(buffer[u], bc)
 
-    for _ in range(max_iter):
+    for _ in range(3000):
         best_delta = 0
         best_action = None
-
         for u in range(1, N + 1):
             if buffer.get(u, 0) <= 0:
                 continue
             existing = set(assignments[u])
             old_u_tran = user_tran_cache[u]
             if old_u_tran >= buffer[u]:
-                continue  # already saturated
-
+                continue
             for t in range(1, T + 1):
                 if not beam_alloc.get(t):
                     continue
@@ -209,8 +214,6 @@ def fast_improve(assignments, resources, res_to_users, su_used, beam_alloc,
                     cur_users = res_to_users.get(key, set())
                     n_before = len(cur_users)
                     n_after = n_before + 1
-
-                    # Constraint check
                     if u in su_set:
                         if n_after > 1:
                             continue
@@ -224,66 +227,57 @@ def fast_improve(assignments, resources, res_to_users, su_used, beam_alloc,
                                 skip = True; break
                         if skip:
                             continue
-
-                    # Delta for u
-                    fse_new = compute_fse(u, n_after, t, beam_alloc, CAP, SINR)
-                    delta = min(buffer[u], old_u_tran + cap_lookup(fse_new)) - old_u_tran
-
-                    # Delta for existing users on this resource
+                    new_cap = cap_fast(fse_fast(u, t, n_after))
+                    delta = min(buffer[u], old_u_tran + new_cap) - old_u_tran
                     if n_before > 0:
                         for cu in cur_users:
-                            old_c = cap_lookup(compute_fse(cu, n_before, t, beam_alloc, CAP, SINR))
-                            new_c = cap_lookup(compute_fse(cu, n_after, t, beam_alloc, CAP, SINR))
+                            old_c = cap_fast(fse_fast(cu, t, n_before))
+                            new_c = cap_fast(fse_fast(cu, t, n_after))
                             if old_c != new_c:
                                 old_ct = user_tran_cache[cu]
                                 delta += min(buffer[cu], old_ct - old_c + new_c) - old_ct
-
                     if delta > best_delta:
                         best_delta = delta
                         best_action = (u, t, rid)
-
         if best_action is None:
             break
-
         u, t, rid = best_action
         key = (t, rid)
         n_before = len(res_to_users.get(key, set()))
-
-        # Apply
         if key not in res_to_users:
             res_to_users[key] = set()
         res_to_users[key].add(u)
         assignments[u].append((t, rid))
-
-        # Update cache
         cur_users = res_to_users[key]
         n_after = len(cur_users)
-        fse_u = compute_fse(u, n_after, t, beam_alloc, CAP, SINR)
-        user_tran_cache[u] = min(buffer[u], user_tran_cache[u] + cap_lookup(fse_u))
-
+        user_tran_cache[u] = min(buffer[u], user_tran_cache[u] +
+                                 cap_fast(fse_fast(u, t, n_after)))
         for cu in cur_users:
             if cu == u:
                 continue
-            old_c = cap_lookup(compute_fse(cu, n_before, t, beam_alloc, CAP, SINR))
-            new_c = cap_lookup(compute_fse(cu, n_after, t, beam_alloc, CAP, SINR))
+            old_c = cap_fast(fse_fast(cu, t, n_before))
+            new_c = cap_fast(fse_fast(cu, t, n_after))
             if old_c != new_c:
                 user_tran_cache[cu] = min(buffer[cu], user_tran_cache[cu] - old_c + new_c)
 
-        # Update resource tracking
-        if u in su_set:
-            su_used.add(key)
-        elif u in mu_to_group:
-            resources[key][0] = mu_to_group[u]
-        resources[key][1] = res_to_users[key]
 
-    return assignments
+def compute_total_T(assignments, res_to_users, beam_alloc, CAP, SINR, buffer, N):
+    total = 0
+    for u in range(1, N + 1):
+        if not assignments[u]:
+            continue
+        bc = 0
+        for sub, rid in assignments[u]:
+            n = len(res_to_users.get((sub, rid), {u}))
+            bc += cap_lookup(compute_fse(u, n, sub, beam_alloc, CAP, SINR))
+        total += min(buffer[u], bc)
+    return total
 
 
 def format_output(beam_alloc, user_alloc, N):
     lines = []
     for t in sorted(beam_alloc.keys()):
-        beams = beam_alloc[t]
-        lines.append(f"{len(beams)}" + ''.join(f" {b}" for b in beams))
+        lines.append(f"{len(beam_alloc[t])}" + ''.join(f" {b}" for b in beam_alloc[t]))
     for i in range(1, N + 1):
         alloc = user_alloc.get(i, [])
         if not alloc:
@@ -297,18 +291,77 @@ def format_output(beam_alloc, user_alloc, N):
     return '\n'.join(lines)
 
 
+def make_user_orders(N, buffer, SINR, CAP, MU, SU, seed=42):
+    """生成多种用户优先级排序（按不同评分函数 + 随机）"""
+    rng = random.Random(seed)
+    tc = {u: sum(CAP[u]) for u in range(1, N + 1)}
+    users = [u for u in range(1, N + 1) if buffer[u] > 0]
+    orders = []
+
+    # 1: buffer × total_cap × sinr_linear (default)
+    orders.append(sorted(users, key=lambda u: buffer[u] * tc[u] *
+                         (10 ** (max(-10, min(30, SINR[u])) / 10)), reverse=True))
+    # 2: buffer only
+    orders.append(sorted(users, key=lambda u: buffer[u], reverse=True))
+    # 3: buffer × total_cap
+    orders.append(sorted(users, key=lambda u: buffer[u] * tc[u], reverse=True))
+    # 4: SINR-weighted buffer
+    orders.append(sorted(users, key=lambda u: buffer[u] * (SINR[u] + 30) * tc[u], reverse=True))
+    # 5: SU first, then MU by buffer
+    su_set = set(SU)
+    su_users = sorted([u for u in users if u in su_set], key=lambda u: buffer[u], reverse=True)
+    mu_users = sorted([u for u in users if u not in su_set], key=lambda u: buffer[u] * tc[u], reverse=True)
+    orders.append(su_users + mu_users)
+    # 6: MU by group, then SU
+    mu_list = []
+    for g in MU:
+        mu_list.extend(sorted(g, key=lambda u: buffer[u] * tc[u], reverse=True))
+    orders.append(mu_list + su_users)
+    # 7-8: reverse of first two
+    orders.append(list(reversed(orders[0])))
+    orders.append(list(reversed(orders[1])))
+    # 9-38: random shuffles (30)
+    for _ in range(30):
+        shuffled = list(users)
+        rng.shuffle(shuffled)
+        orders.append(shuffled)
+
+    return orders
+
+
 def solve():
+    t_start = time.perf_counter()
     data = sys.stdin.read().strip().split('\n')
     if not data or not data[0].strip():
         return
+
     P, N, K, T, beamMaxNum, M, MU, SU, CAP, buffer, SINR, RES_SUB = parse_input(data)
     beam_alloc = allocate_beams(P, T, beamMaxNum, CAP, N, RES_SUB)
-    assignments, resources, res_to_users, su_used = greedy_allocate(
-        N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc)
-    assignments = fast_improve(assignments, resources, res_to_users, su_used,
-                               beam_alloc, CAP, SINR, buffer, RES_SUB,
-                               N, T, MU, SU)
-    print(format_output(beam_alloc, assignments, N))
+    user_orders = make_user_orders(N, buffer, SINR, CAP, MU, SU)
+
+    # Phase 1: greedy on all strategies, keep top 2
+    top = []  # [(T, ua, rtu, su)]
+    for order in user_orders:
+        ua, resources, rtu, su_used = greedy_allocate(
+            N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc, order)
+        T_val = compute_total_T(ua, rtu, beam_alloc, CAP, SINR, buffer, N)
+        top.append((T_val, ua, rtu, su_used))
+        top.sort(key=lambda x: x[0], reverse=True)
+        if len(top) > 2:
+            top.pop()
+
+    # Phase 2: fast_improve on each top result, pick best
+    best_T = -1
+    best_ua = None
+    for _, ua, rtu, su_used in top:
+        fast_improve(ua, rtu, su_used, beam_alloc, CAP, SINR, buffer,
+                     RES_SUB, N, T, MU, SU)
+        T_val = compute_total_T(ua, rtu, beam_alloc, CAP, SINR, buffer, N)
+        if T_val > best_T:
+            best_T = T_val
+            best_ua = ua
+
+    print(format_output(beam_alloc, best_ua, N))
 
 
 if __name__ == '__main__':

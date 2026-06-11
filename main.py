@@ -8,8 +8,9 @@ import os
 
 
 def run_scheduling():
-    from scheduler import parse_input, allocate_beams, greedy_allocate
-    from scheduler import local_improve, format_output
+    from scheduler import (parse_input, allocate_beams, greedy_allocate,
+                           fast_improve, make_user_orders, compute_total_T,
+                           format_output)
 
     data = sys.stdin.read().strip().split('\n')
     if not data or not data[0].strip():
@@ -17,10 +18,30 @@ def run_scheduling():
 
     P, N, K, T, beamMaxNum, M, MU, SU, CAP, buffer, SINR, RES_SUB = parse_input(data)
     beam_alloc = allocate_beams(P, T, beamMaxNum, CAP, N, RES_SUB)
-    user_alloc = greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc)
-    user_alloc = local_improve(user_alloc, beam_alloc, CAP, SINR, buffer, RES_SUB,
-                               N, P, T, MU, SU)
-    print(format_output(beam_alloc, user_alloc, T, N))
+    orders = make_user_orders(N, buffer, SINR, CAP, MU, SU)
+
+    # Greedy on all, keep top 2
+    top = []
+    for order in orders:
+        ua, resources, rtu, su = greedy_allocate(
+            N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc, order)
+        T_val = compute_total_T(ua, rtu, beam_alloc, CAP, SINR, buffer, N)
+        top.append((T_val, ua, rtu, su))
+        top.sort(key=lambda x: x[0], reverse=True)
+        if len(top) > 2:
+            top.pop()
+
+    # Fast improve on each top result
+    best_T = -1
+    best_ua = None
+    for _, ua, rtu, su in top:
+        fast_improve(ua, rtu, su, beam_alloc, CAP, SINR, buffer, RES_SUB, N, T, MU, SU)
+        T_val = compute_total_T(ua, rtu, beam_alloc, CAP, SINR, buffer, N)
+        if T_val > best_T:
+            best_T = T_val
+            best_ua = ua
+
+    print(format_output(beam_alloc, best_ua, N))
 
 
 def run_prediction():
