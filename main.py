@@ -91,17 +91,30 @@ def run_prediction():
     print(f"Wrote {len(test_meta) * 24} rows to results.csv")
 
 
+def _days_in_month(y, m):
+    if m in (1, 3, 5, 7, 8, 10, 12):
+        return 31
+    elif m in (4, 6, 9, 11):
+        return 30
+    elif m == 2:
+        return 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28
+    return 30  # fallback
+
+
 def _next_hour(ts_str):
-    y, m, d, h = ts_str.split()[0].split('/') + [ts_str.split()[1].split(':')[0]]
-    y, m, d, h = int(y), int(m), int(d), int(h)
+    date_part, time_part = ts_str.split()
+    y, m, d = map(int, date_part.split('/'))
+    h = int(time_part.split(':')[0])
     h += 1
     if h >= 24:
         h = 0
         d += 1
-        if m == 7 and d > 31:
-            d, m = 1, 8
-        elif m == 8 and d > 31:
-            d, m = 1, 9
+        if d > _days_in_month(y, m):
+            d = 1
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
     return f'{y}/{m}/{d} {h}:00'
 
 

@@ -211,22 +211,14 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc):
                 # SU needs exclusive access
                 if len(candidate_users) > 1:
                     continue
-            else:
-                # MU user: all users must be from same MU group
-                g = mu_to_group.get(user)
-                if g is not None:
-                    for cu in candidate_users:
-                        if cu in su_set:
-                            break  # can't mix MU and SU
-                        if cu in mu_to_group and mu_to_group[cu] != g:
-                            break  # different MU groups
-                    else:
-                        pass  # OK
-                    if any(cu in su_set for cu in candidate_users):
-                        continue
-                    if any(cu in mu_to_group and mu_to_group[cu] != g
-                           for cu in candidate_users):
-                        continue
+            elif user in mu_to_group:
+                # MU user: all co-users must be from same MU group, no SU mixing
+                g = mu_to_group[user]
+                if any(cu in su_set for cu in candidate_users):
+                    continue
+                if any(cu in mu_to_group and mu_to_group[cu] != g
+                       for cu in candidate_users):
+                    continue
 
             fse = compute_fse(user, candidate_users, t, beam_alloc, CAP, SINR)
             capacity = cap_lookup(fse)

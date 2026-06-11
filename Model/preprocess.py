@@ -63,7 +63,12 @@ def load_weather(path):
             continue
         wt = row[1].strip()
         wt_onehot = [1.0 if wt == w else 0.0 for w in weather_types]
-        numeric = [float(v) for v in row[2:]]
+        numeric = []
+        for v in row[2:]:
+            try:
+                numeric.append(float(v))
+            except (ValueError, TypeError):
+                numeric.append(0.0)
         weather[date_str] = np.array(wt_onehot + numeric, dtype=np.float32)
     return weather
 
