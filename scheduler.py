@@ -188,7 +188,7 @@ def fast_improve(assignments, resources, res_to_users, su_used, beam_alloc,
             user_tran_cache[u] = min(buffer[u], bc)
 
     for _ in range(max_iter):
-        best_delta = 1e-9
+        best_delta = 0
         best_action = None
 
         for u in range(1, N + 1):
@@ -279,10 +279,10 @@ def fast_improve(assignments, resources, res_to_users, su_used, beam_alloc,
     return assignments
 
 
-def format_output(beam_alloc, user_alloc, T, N):
+def format_output(beam_alloc, user_alloc, N):
     lines = []
-    for t in range(1, T + 1):
-        beams = beam_alloc.get(t, [])
+    for t in sorted(beam_alloc.keys()):
+        beams = beam_alloc[t]
         lines.append(f"{len(beams)}" + ''.join(f" {b}" for b in beams))
     for i in range(1, N + 1):
         alloc = user_alloc.get(i, [])
@@ -308,7 +308,7 @@ def solve():
     assignments = fast_improve(assignments, resources, res_to_users, su_used,
                                beam_alloc, CAP, SINR, buffer, RES_SUB,
                                N, T, MU, SU)
-    print(format_output(beam_alloc, assignments, T, N))
+    print(format_output(beam_alloc, assignments, N))
 
 
 if __name__ == '__main__':
