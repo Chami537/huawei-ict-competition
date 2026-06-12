@@ -82,7 +82,7 @@ def run_prediction():
     X_test_norm = (X_test - norm_data['feat_mean']) / (norm_data['feat_std'] + 1e-8)
     X_test_norm = np.clip(X_test_norm, -10, 10)
 
-    model = MLP(X_test_norm.shape[1], [512, 256], 96)
+    model = MLP(X_test_norm.shape[1], [256, 128, 64], 96)
     model.load(os.path.join(model_dir, 'best_model.npz'))
 
     Y_pred_norm = model.predict(X_test_norm)

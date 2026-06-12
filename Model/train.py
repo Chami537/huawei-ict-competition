@@ -48,7 +48,7 @@ def main():
         Y_val_raw=Y_train_raw[val_idx],
         Y_mean=norm_params['Y_mean'],
         Y_std=norm_params['Y_std'],
-        hidden_dims=[512, 256],
+        hidden_dims=[256, 128, 64],
         epochs=300,
         batch_size=128,
         lr=0.001,
