@@ -31,11 +31,12 @@ def run_scheduling():
         if len(top) > 2:
             top.pop()
 
-    # Fast improve on each top result
+    # Fast improve with swap on each top result
     best_T = -1
     best_ua = None
     for _, ua, rtu, su in top:
-        fast_improve(ua, rtu, su, beam_alloc, CAP, SINR, buffer, RES_SUB, N, T, MU, SU)
+        fast_improve(ua, rtu, su, beam_alloc, CAP, SINR, buffer, RES_SUB, N, T, MU, SU,
+                     max_iter=3000, sa_mode=False, enable_swap=True)
         T_val = compute_total_T(ua, rtu, beam_alloc, CAP, SINR, buffer, N)
         if T_val > best_T:
             best_T = T_val

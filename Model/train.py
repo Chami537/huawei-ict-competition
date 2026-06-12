@@ -33,15 +33,13 @@ def main():
         Y_std=norm_params['Y_std'],
     )
 
-    # Train/val split: random 90/10
-    np.random.seed(42)
-    indices = np.random.permutation(len(X_train))
-    split = int(len(indices) * 0.9)
-    train_idx = indices[:split]
-    val_idx = indices[split:]
+    # Time-ordered split: first 90% train, last 10% validation
+    split = int(len(X_train) * 0.9)
+    train_idx = np.arange(split)
+    val_idx = np.arange(split, len(X_train))
 
     input_dim = X_train.shape[1]
-    print(f"\n=== Training ({split} train, {len(indices) - split} val, {input_dim} features) ===")
+    print(f"\n=== Training ({split} train, {len(X_train) - split} val, {input_dim} features) ===")
     model = train_model(
         X_train[train_idx], Y_train_norm[train_idx],
         X_val=X_train[val_idx], Y_val=Y_train_norm[val_idx],
