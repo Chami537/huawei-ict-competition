@@ -28,6 +28,16 @@ def ts_to_date_str(ts):
     return f'{y}{m:02d}{d:02d}'
 
 
+def _days_in_month_static(y, m):
+    if m in (1, 3, 5, 7, 8, 10, 12):
+        return 31
+    elif m in (4, 6, 9, 11):
+        return 30
+    elif m == 2:
+        return 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28
+    return 30
+
+
 def date_to_days(y, m, d):
     if m <= 2:
         y -= 1
@@ -231,8 +241,8 @@ def extract_features(input_records, weather, cell_params, output_hours=24):
     last24_mean = np.mean(last24, axis=0)
     last24_std = np.std(last24, axis=0)
 
-    # Combine
-    X = np.concatenate([
+    # Combine base features
+    X_base = np.concatenate([
         global_mean, global_std, global_min, global_max,   # 16
         global_p25, global_p75,                             # 8
         recent_stats,                                        # 32
@@ -244,7 +254,67 @@ def extract_features(input_records, weather, cell_params, output_hours=24):
         avg_weather,                                         # 11
         cell_params,                                         # 29
     ]).astype(np.float32)
-    # Total: 16+8+32+96+28+4+192+8+11+29 = 424 features
+    # Total base: 16+8+32+96+28+4+192+8+11+29 = 424 features
+
+    # ── Prediction-time encoding ──
+    # Compute first prediction hour from the last input record
+    last_ts = input_records[-1][0]
+    y, m, d, last_h = parse_datetime(last_ts)
+
+    pred_h = last_h + 1
+    pred_d = d
+    pred_m = m
+    pred_y = y
+    if pred_h >= 24:
+        pred_h = 0
+        pred_d += 1
+        dim = _days_in_month_static(pred_y, pred_m)
+        if pred_d > dim:
+            pred_d = 1
+            pred_m += 1
+            if pred_m > 12:
+                pred_m = 1
+                pred_y += 1
+
+    # Hour-of-day sin/cos
+    pred_hour_sin = math.sin(2 * math.pi * pred_h / 24.0)
+    pred_hour_cos = math.cos(2 * math.pi * pred_h / 24.0)
+
+    # Day-of-week sin/cos
+    days_since_epoch = date_to_days(pred_y, pred_m, pred_d) - date_to_days(2024, 7, 20)
+    pred_dow = days_since_epoch % 7
+    pred_dow_sin = math.sin(2 * math.pi * pred_dow / 7.0)
+    pred_dow_cos = math.cos(2 * math.pi * pred_dow / 7.0)
+
+    time_enc = np.array([pred_hour_sin, pred_hour_cos, pred_dow_sin, pred_dow_cos], dtype=np.float32)
+
+    # ── Prediction-day weather ──
+    pred_date1 = f'{pred_y}{pred_m:02d}{pred_d:02d}'
+    pred_w1 = weather.get(pred_date1)
+    if pred_w1 is None:
+        pred_w1 = np.zeros(11, dtype=np.float32)
+
+    # If prediction starts after hour 0, it spans into the next calendar day
+    if pred_h > 0:
+        next_d = pred_d + 1
+        next_m = pred_m
+        next_y = pred_y
+        dim = _days_in_month_static(next_y, next_m)
+        if next_d > dim:
+            next_d = 1
+            next_m += 1
+            if next_m > 12:
+                next_m = 1
+                next_y += 1
+        pred_date2 = f'{next_y}{next_m:02d}{next_d:02d}'
+        pred_w2 = weather.get(pred_date2)
+        if pred_w2 is None:
+            pred_w2 = np.zeros(11, dtype=np.float32)
+    else:
+        pred_w2 = pred_w1.copy()
+
+    X = np.concatenate([X_base, time_enc, pred_w1, pred_w2]).astype(np.float32)
+    # Total: 424 + 4(time_enc) + 11(day1_weather) + 11(day2_weather) = 450
 
     return X
 

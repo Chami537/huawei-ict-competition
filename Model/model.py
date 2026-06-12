@@ -127,7 +127,7 @@ def train_model(X_train, Y_train, X_val=None, Y_val=None,
                 lr_decay_epochs=50, model_path=None, seed=42):
     """训练 MLP 模型"""
     if hidden_dims is None:
-        hidden_dims = [256, 128, 64]
+        hidden_dims = [512, 256]
 
     input_dim = X_train.shape[1]
     output_dim = Y_train.shape[1]

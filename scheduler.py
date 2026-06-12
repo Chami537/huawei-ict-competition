@@ -155,8 +155,9 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc,
 
 
 def fast_improve(assignments, res_to_users, su_used, beam_alloc,
-                 CAP, SINR, buffer, RES_SUB, N, T, MU, SU):
-    """快速增量改进（预计算 base_fse 加速）"""
+                 CAP, SINR, buffer, RES_SUB, N, T, MU, SU,
+                 max_iter=20000, T_init=50.0, time_budget_ms=45.0):
+    """模拟退火增量改进（预计算 base_fse 加速，可跳出局部最优）"""
     mu_to_group = {}
     for g_idx, group in enumerate(MU):
         for u in group:
@@ -194,8 +195,48 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
                 bc += cap_fast(fse_fast(u, sub, n))
             user_tran_cache[u] = min(buffer[u], bc)
 
-    for _ in range(3000):
-        best_delta = 0
+    def _total():
+        return compute_total_T(assignments, res_to_users, beam_alloc, CAP, SINR, buffer, N)
+
+    def _snapshot():
+        return ({u: list(assignments[u]) for u in assignments},
+                {k: set(v) for k, v in res_to_users.items()},
+                set(su_used))
+
+    def _restore(snap):
+        nonlocal user_tran_cache
+        a, r, s = snap
+        assignments.clear()
+        assignments.update(a)
+        res_to_users.clear()
+        res_to_users.update(r)
+        su_used.clear()
+        su_used.update(s)
+        user_tran_cache = {}
+        for u in range(1, N + 1):
+            if not assignments[u]:
+                user_tran_cache[u] = 0
+            else:
+                bc = 0
+                for sub, rid in assignments[u]:
+                    n = len(res_to_users.get((sub, rid), {u}))
+                    bc += cap_fast(fse_fast(u, sub, n))
+                user_tran_cache[u] = min(buffer[u], bc)
+
+    best_T_val = _total()
+    best_snapshot = _snapshot()
+    T_sa = T_init
+    no_improve = 0
+    t_start = time.perf_counter()
+
+    for i in range(max_iter):
+        # Time-budget check every 50 iterations
+        if i % 50 == 0:
+            elapsed = (time.perf_counter() - t_start) * 1000
+            if elapsed > time_budget_ms:
+                break
+
+        best_delta = -1e9
         best_action = None
         for u in range(1, N + 1):
             if buffer.get(u, 0) <= 0:
@@ -239,26 +280,58 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
                     if delta > best_delta:
                         best_delta = delta
                         best_action = (u, t, rid)
+
         if best_action is None:
             break
-        u, t, rid = best_action
-        key = (t, rid)
-        n_before = len(res_to_users.get(key, set()))
-        if key not in res_to_users:
-            res_to_users[key] = set()
-        res_to_users[key].add(u)
-        assignments[u].append((t, rid))
-        cur_users = res_to_users[key]
-        n_after = len(cur_users)
-        user_tran_cache[u] = min(buffer[u], user_tran_cache[u] +
-                                 cap_fast(fse_fast(u, t, n_after)))
-        for cu in cur_users:
-            if cu == u:
-                continue
-            old_c = cap_fast(fse_fast(cu, t, n_before))
-            new_c = cap_fast(fse_fast(cu, t, n_after))
-            if old_c != new_c:
-                user_tran_cache[cu] = min(buffer[cu], user_tran_cache[cu] - old_c + new_c)
+
+        # Simulated annealing acceptance
+        if best_delta > 0:
+            accept = True
+        else:
+            accept_prob = math.exp(best_delta / max(T_sa, 1e-4))
+            accept = random.random() < accept_prob
+
+        if accept:
+            u, t, rid = best_action
+            key = (t, rid)
+            n_before = len(res_to_users.get(key, set()))
+            if key not in res_to_users:
+                res_to_users[key] = set()
+            res_to_users[key].add(u)
+            assignments[u].append((t, rid))
+            cur_users = res_to_users[key]
+            n_after = len(cur_users)
+            user_tran_cache[u] = min(buffer[u], user_tran_cache[u] +
+                                     cap_fast(fse_fast(u, t, n_after)))
+            for cu in cur_users:
+                if cu == u:
+                    continue
+                old_c = cap_fast(fse_fast(cu, t, n_before))
+                new_c = cap_fast(fse_fast(cu, t, n_after))
+                if old_c != new_c:
+                    user_tran_cache[cu] = min(buffer[cu], user_tran_cache[cu] - old_c + new_c)
+
+            # Track best
+            cur_T = _total()
+            if cur_T > best_T_val:
+                best_T_val = cur_T
+                best_snapshot = _snapshot()
+                no_improve = 0
+            else:
+                no_improve += 1
+        else:
+            no_improve += 1
+
+        # Linear temperature decay
+        T_sa = T_init * (1.0 - (i + 1) / max_iter)
+
+        # Early stop: cold and no improvement for long
+        if T_sa < 0.1 and no_improve > 500:
+            break
+
+    # Restore best solution found
+    if _total() < best_T_val:
+        _restore(best_snapshot)
 
 
 def compute_total_T(assignments, res_to_users, beam_alloc, CAP, SINR, buffer, N):
