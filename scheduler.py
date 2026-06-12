@@ -155,8 +155,10 @@ def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc,
 
 
 def fast_improve(assignments, res_to_users, su_used, beam_alloc,
-                 CAP, SINR, buffer, RES_SUB, N, T, MU, SU):
-    """快速增量改进（预计算 base_fse 加速）"""
+                 CAP, SINR, buffer, RES_SUB, N, T, MU, SU,
+                 max_iter=3000, sa_mode=False, T_init=50.0,
+                 time_budget_ms=float('inf'), enable_swap=True):
+    """增量改进（Add + Swap），可选 SA 模式，预计算 base_fse 加速"""
     mu_to_group = {}
     for g_idx, group in enumerate(MU):
         for u in group:
@@ -194,71 +196,289 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
                 bc += cap_fast(fse_fast(u, sub, n))
             user_tran_cache[u] = min(buffer[u], bc)
 
-    for _ in range(3000):
-        best_delta = 0
-        best_action = None
+    # SA state
+    current_total = sum(user_tran_cache.values())
+    best_total = current_total
+    best_snapshot = None
+    T_sa = T_init
+    no_improve = 0
+    t_start = time.perf_counter()
+
+    def _make_undo_add(u, t, rid):
+        return ('undo_add', u, t, rid)
+
+    def _make_undo_swap(u, t_old, rid_old, t_new, rid_new):
+        return ('undo_swap', u, t_old, rid_old, t_new, rid_new)
+
+    undo_action = None  # filled before each apply
+
+    # Precompute flat resource list for swap enumeration
+    all_res = [(t, rid) for t in range(1, T + 1) if beam_alloc.get(t)
+               for rid in RES_SUB[t]]
+
+    is_su = {u: u in su_set for u in range(1, N + 1)}
+
+    for it in range(max_iter):
+        # Granular time check (before heavy eval)
+        if sa_mode and it % 2 == 0:
+            if (time.perf_counter() - t_start) * 1000 > time_budget_ms:
+                break
+
+        best_delta = -1e-9
+        best_action = None  # ('add', u, t, rid) or ('swap', u, t_old, rid_old, t_new, rid_new)
+
         for u in range(1, N + 1):
+            # Time check inside eval loop (SA can be slow)
+            if sa_mode and u % 3 == 0:
+                if (time.perf_counter() - t_start) * 1000 > time_budget_ms:
+                    break
             if buffer.get(u, 0) <= 0:
                 continue
             existing = set(assignments[u])
             old_u_tran = user_tran_cache[u]
-            if old_u_tran >= buffer[u]:
-                continue
-            for t in range(1, T + 1):
-                if not beam_alloc.get(t):
-                    continue
-                for rid in RES_SUB[t]:
-                    if (t, rid) in existing:
+
+            # --- Add ---
+            if old_u_tran < buffer[u]:
+                for t in range(1, T + 1):
+                    if not beam_alloc.get(t):
                         continue
-                    key = (t, rid)
-                    cur_users = res_to_users.get(key, set())
-                    n_before = len(cur_users)
-                    n_after = n_before + 1
-                    if u in su_set:
-                        if n_after > 1:
+                    for rid in RES_SUB[t]:
+                        if (t, rid) in existing:
                             continue
-                    elif u in mu_to_group:
-                        g = mu_to_group[u]
-                        skip = False
-                        for cu in cur_users:
-                            if cu in su_set:
-                                skip = True; break
-                            if cu in mu_to_group and mu_to_group[cu] != g:
-                                skip = True; break
-                        if skip:
-                            continue
-                    new_cap = cap_fast(fse_fast(u, t, n_after))
-                    delta = min(buffer[u], old_u_tran + new_cap) - old_u_tran
-                    if n_before > 0:
-                        for cu in cur_users:
-                            old_c = cap_fast(fse_fast(cu, t, n_before))
-                            new_c = cap_fast(fse_fast(cu, t, n_after))
-                            if old_c != new_c:
-                                old_ct = user_tran_cache[cu]
-                                delta += min(buffer[cu], old_ct - old_c + new_c) - old_ct
-                    if delta > best_delta:
-                        best_delta = delta
-                        best_action = (u, t, rid)
+                        key = (t, rid)
+                        cur_users = res_to_users.get(key, set())
+                        n_before = len(cur_users)
+                        n_after = n_before + 1
+                        if is_su[u]:
+                            if n_after > 1:
+                                continue
+                        elif u in mu_to_group:
+                            g = mu_to_group[u]
+                            skip = False
+                            for cu in cur_users:
+                                if is_su[cu]:
+                                    skip = True; break
+                                if cu in mu_to_group and mu_to_group[cu] != g:
+                                    skip = True; break
+                            if skip:
+                                continue
+                        new_cap = cap_fast(fse_fast(u, t, n_after))
+                        delta = min(buffer[u], old_u_tran + new_cap) - old_u_tran
+                        if n_before > 0:
+                            for cu in cur_users:
+                                old_c = cap_fast(fse_fast(cu, t, n_before))
+                                new_c = cap_fast(fse_fast(cu, t, n_after))
+                                if old_c != new_c:
+                                    old_ct = user_tran_cache[cu]
+                                    delta += min(buffer[cu], old_ct - old_c + new_c) - old_ct
+                        if delta > best_delta:
+                            best_delta = delta
+                            best_action = (0, u, t, rid)
+
+            # --- Swap (sampled to limit cost) ---
+            if enable_swap and existing:
+                # Pick one random existing resource
+                t_old, rid_old = random.choice(list(existing))
+                old_key = (t_old, rid_old)
+                old_cur = res_to_users.get(old_key, set())
+                n_old_before = len(old_cur)
+                old_u_cap = cap_fast(fse_fast(u, t_old, n_old_before))
+
+                # Sample candidate resources (full scan too expensive)
+                candidates = [r for r in all_res if r not in existing
+                              and r[0] != t_old]  # exclude same timeslot
+                if len(candidates) > 8:
+                    candidates = random.sample(candidates, 8)
+                for t_new, rid_new in candidates:
+                        new_key = (t_new, rid_new)
+                        new_cur = res_to_users.get(new_key, set())
+                        n_new_before = len(new_cur)
+                        n_new_after = n_new_before + 1
+
+                        # Validate new resource (same rules as add)
+                        if is_su[u]:
+                            if n_new_after > 1:
+                                continue
+                        elif u in mu_to_group:
+                            g = mu_to_group[u]
+                            skip = False
+                            for cu in new_cur:
+                                if is_su[cu]:
+                                    skip = True; break
+                                if cu in mu_to_group and mu_to_group[cu] != g:
+                                    skip = True; break
+                            if skip:
+                                continue
+
+                        new_u_cap = cap_fast(fse_fast(u, t_new, n_new_after))
+
+                        # Delta for user u
+                        delta = (min(buffer[u], old_u_tran - old_u_cap + new_u_cap)
+                                 - old_u_tran)
+
+                        # Co-users on OLD resource gain capacity (u leaves)
+                        n_old_after = n_old_before - 1
+                        if n_old_after > 0:
+                            for cu in old_cur:
+                                if cu == u:
+                                    continue
+                                old_c = cap_fast(fse_fast(cu, t_old, n_old_before))
+                                new_c = cap_fast(fse_fast(cu, t_old, n_old_after))
+                                if old_c != new_c:
+                                    old_ct = user_tran_cache[cu]
+                                    delta += (min(buffer[cu], old_ct - old_c + new_c)
+                                              - old_ct)
+
+                        # Co-users on NEW resource lose capacity (u joins)
+                        if n_new_before > 0:
+                            for cu in new_cur:
+                                if cu == u:
+                                    continue
+                                old_c = cap_fast(fse_fast(cu, t_new, n_new_before))
+                                new_c = cap_fast(fse_fast(cu, t_new, n_new_after))
+                                if old_c != new_c:
+                                    old_ct = user_tran_cache[cu]
+                                    delta += (min(buffer[cu], old_ct - old_c + new_c)
+                                              - old_ct)
+
+                        if delta > best_delta:
+                            best_delta = delta
+                            best_action = (1, u, t_old, rid_old, t_new, rid_new)
+
         if best_action is None:
             break
-        u, t, rid = best_action
-        key = (t, rid)
-        n_before = len(res_to_users.get(key, set()))
-        if key not in res_to_users:
-            res_to_users[key] = set()
-        res_to_users[key].add(u)
-        assignments[u].append((t, rid))
-        cur_users = res_to_users[key]
-        n_after = len(cur_users)
-        user_tran_cache[u] = min(buffer[u], user_tran_cache[u] +
-                                 cap_fast(fse_fast(u, t, n_after)))
-        for cu in cur_users:
-            if cu == u:
-                continue
-            old_c = cap_fast(fse_fast(cu, t, n_before))
-            new_c = cap_fast(fse_fast(cu, t, n_after))
-            if old_c != new_c:
-                user_tran_cache[cu] = min(buffer[cu], user_tran_cache[cu] - old_c + new_c)
+
+        # --- Apply action ---
+        old_cache = {}  # for undo: {u: old_val}
+        if best_action[0] == 0:  # Add
+            _, u, t, rid = best_action
+            key = (t, rid)
+            n_before = len(res_to_users.get(key, set()))
+            if key not in res_to_users:
+                res_to_users[key] = set()
+            res_to_users[key].add(u)
+            assignments[u].append((t, rid))
+            cur_users = res_to_users[key]
+            n_after = len(cur_users)
+            old_cache[u] = user_tran_cache[u]
+            user_tran_cache[u] = min(buffer[u], user_tran_cache[u] +
+                                     cap_fast(fse_fast(u, t, n_after)))
+            for cu in cur_users:
+                if cu == u:
+                    continue
+                old_c = cap_fast(fse_fast(cu, t, n_before))
+                new_c = cap_fast(fse_fast(cu, t, n_after))
+                if old_c != new_c:
+                    old_cache[cu] = user_tran_cache[cu]
+                    user_tran_cache[cu] = min(buffer[cu],
+                                              user_tran_cache[cu] - old_c + new_c)
+
+            def _undo_add():
+                res_to_users[key].discard(u)
+                if not res_to_users[key]:
+                    del res_to_users[key]
+                assignments[u].remove((t, rid))
+                for cu, old_v in old_cache.items():
+                    user_tran_cache[cu] = old_v
+
+            undo_func = _undo_add
+
+        else:  # Swap
+            _, u, t_old, rid_old, t_new, rid_new = best_action
+            old_key = (t_old, rid_old)
+            new_key = (t_new, rid_new)
+
+            n_old_before = len(res_to_users.get(old_key, set()))
+            old_u_cap = cap_fast(fse_fast(u, t_old, n_old_before))
+
+            # Remove old
+            assignments[u].remove((t_old, rid_old))
+            if old_key in res_to_users:
+                res_to_users[old_key].discard(u)
+                if not res_to_users[old_key]:
+                    del res_to_users[old_key]
+
+            old_affected = {}
+            for cu in res_to_users.get(old_key, set()):
+                old_c = cap_fast(fse_fast(cu, t_old, n_old_before))
+                new_c = cap_fast(fse_fast(cu, t_old, n_old_before - 1))
+                if old_c != new_c:
+                    old_affected[cu] = user_tran_cache[cu]
+                    user_tran_cache[cu] = min(buffer[cu],
+                                              user_tran_cache[cu] - old_c + new_c)
+
+            # Add new
+            n_new_before = len(res_to_users.get(new_key, set()))
+            if new_key not in res_to_users:
+                res_to_users[new_key] = set()
+            res_to_users[new_key].add(u)
+            assignments[u].append((t_new, rid_new))
+
+            old_cache[u] = user_tran_cache[u]  # capture pre-swap value
+            new_u_cap = cap_fast(fse_fast(u, t_new, n_new_before + 1))
+            user_tran_cache[u] = min(buffer[u],
+                                     user_tran_cache[u] - old_u_cap + new_u_cap)
+
+            new_affected = {}
+            for cu in res_to_users[new_key]:
+                if cu == u:
+                    continue
+                old_c = cap_fast(fse_fast(cu, t_new, n_new_before))
+                new_c = cap_fast(fse_fast(cu, t_new, n_new_before + 1))
+                if old_c != new_c:
+                    new_affected[cu] = user_tran_cache[cu]
+                    user_tran_cache[cu] = min(buffer[cu],
+                                              user_tran_cache[cu] - old_c + new_c)
+
+            def _undo_swap():
+                # Remove new
+                assignments[u].remove((t_new, rid_new))
+                if new_key in res_to_users:
+                    res_to_users[new_key].discard(u)
+                    if not res_to_users[new_key]:
+                        del res_to_users[new_key]
+                # Restore old
+                assignments[u].append((t_old, rid_old))
+                if old_key not in res_to_users:
+                    res_to_users[old_key] = set()
+                res_to_users[old_key].add(u)
+                # Restore all affected caches
+                user_tran_cache[u] = old_cache[u]
+                for cu, old_v in old_affected.items():
+                    user_tran_cache[cu] = old_v
+                for cu, old_v in new_affected.items():
+                    user_tran_cache[cu] = old_v
+
+            undo_func = _undo_swap
+
+        new_total = sum(user_tran_cache.values())
+
+        # --- SA accept/reject ---
+        if sa_mode and best_delta <= 0:
+            accept_prob = math.exp(best_delta / max(T_sa, 1e-4))
+            if random.random() >= accept_prob:
+                undo_func()
+                no_improve += 1
+            else:
+                current_total = new_total
+                no_improve = 0
+                if current_total > best_total:
+                    best_total = current_total
+        else:
+            current_total = new_total
+            no_improve = 0
+            if sa_mode and current_total > best_total:
+                best_total = current_total
+        # Note: greedy mode (non-SA) doesn't need best tracking — last state is best
+
+        # --- Temperature decay + time check ---
+        if sa_mode:
+            T_sa = T_init * (1.0 - (it + 1) / max(max_iter, 1))
+            elapsed = (time.perf_counter() - t_start) * 1000
+            if elapsed > time_budget_ms:
+                break
+            if T_sa < 0.1 and no_improve > 500:
+                break
 
 
 def compute_total_T(assignments, res_to_users, beam_alloc, CAP, SINR, buffer, N):
@@ -272,6 +492,43 @@ def compute_total_T(assignments, res_to_users, beam_alloc, CAP, SINR, buffer, N)
             bc += cap_lookup(compute_fse(u, n, sub, beam_alloc, CAP, SINR))
         total += min(buffer[u], bc)
     return total
+
+
+def compute_congestion(assignments, buffer, N, T):
+    """按时隙统计用户需求密度（拥挤度）"""
+    t_demand = {t: 0.0 for t in range(1, T + 1)}
+    t_count = {t: 0 for t in range(1, T + 1)}
+    for u in range(1, N + 1):
+        if not assignments[u] or buffer.get(u, 0) <= 0:
+            continue
+        seen_t = set()
+        for t, rid in assignments[u]:
+            if t not in seen_t:
+                seen_t.add(t)
+                t_demand[t] += buffer[u]
+                t_count[t] += 1
+    congestion = {}
+    for t in range(1, T + 1):
+        congestion[t] = t_demand[t] / t_count[t] if t_count[t] > 0 else 0.0
+    return congestion
+
+
+def reallocate_beams(beam_alloc, congestion, P, T, beamMaxNum):
+    """从最不拥挤时隙移一个波束到最拥挤时隙"""
+    if not congestion:
+        return
+    sorted_t = sorted(congestion.keys(),
+                      key=lambda t: (congestion[t], t), reverse=True)
+    most_t = sorted_t[0]
+    least_t = sorted_t[-1]
+    if congestion[most_t] <= congestion[least_t] * 1.1:
+        return  # gap too small
+    if len(beam_alloc[most_t]) >= P:
+        return
+    if len(beam_alloc[least_t]) <= 1:
+        return
+    beam = beam_alloc[least_t].pop()
+    beam_alloc[most_t].append(beam)
 
 
 def format_output(beam_alloc, user_alloc, N):
@@ -340,7 +597,7 @@ def solve():
     user_orders = make_user_orders(N, buffer, SINR, CAP, MU, SU)
 
     # Phase 1: greedy on all strategies, keep top 2
-    top = []  # [(T, ua, rtu, su)]
+    top = []
     for order in user_orders:
         ua, resources, rtu, su_used = greedy_allocate(
             N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc, order)
@@ -350,12 +607,13 @@ def solve():
         if len(top) > 2:
             top.pop()
 
-    # Phase 2: fast_improve on each top result, pick best
+    # Phase 2: fast_improve with swap on each top result, pick best
     best_T = -1
     best_ua = None
     for _, ua, rtu, su_used in top:
         fast_improve(ua, rtu, su_used, beam_alloc, CAP, SINR, buffer,
-                     RES_SUB, N, T, MU, SU)
+                     RES_SUB, N, T, MU, SU, max_iter=3000,
+                     sa_mode=False, enable_swap=True)
         T_val = compute_total_T(ua, rtu, beam_alloc, CAP, SINR, buffer, N)
         if T_val > best_T:
             best_T = T_val
