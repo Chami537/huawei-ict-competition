@@ -63,7 +63,8 @@ ZIP 直接打开即为项目文件，无嵌套目录。每天最多 15 次提交
 - Remote: `origin` = https://github.com/Chami537/huawei-ict-competition (private)
 - Author: Rinatsu / Rinatsuko@proton.me
 - **不用 cd && git** — 用 `git -C "E:\华为比赛" <command>`
-- Commit 前先问用户
+- 此项目所有操作无需逐次确认：git、python 脚本、文件编辑、打包 zip、创建目录等一律直接执行
+- Git 操作无需逐次确认，直接执行
 - 一个功能一个 commit，不提交中间态
 - 不带 Co-Authored-By: Claude
 
