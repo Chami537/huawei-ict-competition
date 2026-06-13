@@ -91,67 +91,156 @@ def compute_fse(user, n_users, sub_band, beam_alloc, CAP, SINR):
     return sinr + share_penalty + lin2db(cap_with) - lin2db(cap_all)
 
 
+def _best_config_for_resource(t, N, MU, SU, CAP, buffer, SINR, beam_alloc,
+                               mu_to_group, su_set, rem_buf, alloc_res,
+                               cap_lookup_fn, compute_fse_fn):
+    """资源驱动：对时隙t的一个资源块，选最优配置（单人 or RU内多人共享）。
+    返回 (best_gain, chosen_users, rates) 或 (0, [], [])。"""
+    best_gain = 0.0
+    best_users = []
+    best_rates = []
+
+    # 1) Single-user: best individual gain
+    for u in range(1, N + 1):
+        if rem_buf[u] <= 1e-9:
+            continue
+        fse = compute_fse_fn(u, 1, t, beam_alloc, CAP, SINR)
+        r = cap_lookup_fn(fse)
+        if r <= 0:
+            continue
+        gain = min(rem_buf[u], r)
+        if gain > best_gain:
+            best_gain = gain
+            best_users = [u]
+            best_rates = [r]
+
+    # 2) RU内共享: for each RU group, try s=2..min(10, |valid_users|)
+    for m, group in enumerate(MU):
+        # Filter: users in this RU with remaining buffer & not SU
+        avail = [(u, compute_fse_fn(u, 2, t, beam_alloc, CAP, SINR),
+                  cap_lookup_fn(compute_fse_fn(u, 2, t, beam_alloc, CAP, SINR)))
+                 for u in group if rem_buf[u] > 1e-9 and u not in su_set]
+        if len(avail) < 2:
+            continue
+        smax = min(10, len(avail))
+        for s in range(2, smax + 1):
+            # Recompute rates for sharing size s
+            contribs = []
+            for u, _, _ in avail:
+                fse_s = compute_fse_fn(u, s, t, beam_alloc, CAP, SINR)
+                r_s = cap_lookup_fn(fse_s)
+                if r_s > 0:
+                    contribs.append((min(rem_buf[u], r_s), u, r_s))
+            if len(contribs) < s:
+                continue
+            contribs.sort(reverse=True)
+            gain = sum(c[0] for c in contribs[:s])
+            if gain > best_gain:
+                best_gain = gain
+                best_users = [c[1] for c in contribs[:s]]
+                best_rates = [c[2] for c in contribs[:s]]
+
+    return best_gain, best_users, best_rates
+
+
 def greedy_allocate(N, K, T, MU, SU, CAP, buffer, SINR, RES_SUB, beam_alloc,
-                    user_order):
-    """贪心分配：按给定顺序处理用户，每个用户选最佳资源"""
+                    user_order=None, resource_driven=True):
+    """贪心分配：resource_driven=True 时按资源块选最优配置（含RU共享）；
+       resource_driven=False 时按用户顺序分配（兼容旧版）。"""
     mu_to_group = {}
     for g_idx, group in enumerate(MU):
         for u in group:
             mu_to_group[u] = g_idx
     su_set = set(SU)
 
-    resources = {}
+    # Precompute resource list sorted by sub-band beam count (more beams = higher priority)
+    all_resources = []
     for t in range(1, T + 1):
+        beams = len(beam_alloc.get(t, []))
         for rid in RES_SUB[t]:
-            resources[(t, rid)] = [None, set()]
+            all_resources.append((t, rid, beams))
+    all_resources.sort(key=lambda x: x[2], reverse=True)
 
     assignments = {u: [] for u in range(1, N + 1)}
-    su_used = set()
-
-    for user in user_order:
-        if buffer.get(user, 0) <= 0:
-            continue
-        best_fse = -1e9
-        best_res = None
-        for (t, rid), (group, users) in resources.items():
-            if (t, rid) in su_used:
-                if user not in su_set:
-                    if group is not None and mu_to_group.get(user) != group:
-                        continue
-                else:
-                    continue
-            candidate = users | {user}
-            n_after = len(candidate)
-            if user in su_set:
-                if n_after > 1:
-                    continue
-            elif user in mu_to_group:
-                g = mu_to_group[user]
-                if any(cu in su_set for cu in candidate):
-                    continue
-                if any(mu_to_group.get(cu, g) != g for cu in candidate if cu in mu_to_group):
-                    continue
-            fse = compute_fse(user, n_after, t, beam_alloc, CAP, SINR)
-            if cap_lookup(fse) > 0 and fse > best_fse:
-                best_fse = fse
-                best_res = (t, rid)
-        if best_res is not None:
-            t, rid = best_res
-            assignments[user].append(best_res)
-            resources[(t, rid)][1].add(user)
-            if user in su_set:
-                su_used.add((t, rid))
-            elif user in mu_to_group:
-                resources[(t, rid)][0] = mu_to_group[user]
-
     res_to_users = {}
-    for u, res_list in assignments.items():
-        for sub, rid in res_list:
-            key = (sub, rid)
-            if key not in res_to_users:
-                res_to_users[key] = set()
-            res_to_users[key].add(u)
-    return assignments, resources, res_to_users, su_used
+    su_used = set()
+    rem_buf = {u: float(buffer.get(u, 0)) for u in range(1, N + 1)}
+
+    if resource_driven:
+        # Resource-driven: for each resource, pick best config
+        for t, rid, _ in all_resources:
+            if beam_alloc.get(t) is None:
+                continue
+            # Check if resource is SU-reserved and already has SU
+            if (t, rid) in su_used:
+                continue
+            gain, users, rates = _best_config_for_resource(
+                t, N, MU, SU, CAP, buffer, SINR, beam_alloc,
+                mu_to_group, su_set, rem_buf, (t, rid),
+                cap_lookup, compute_fse)
+            if gain > 0 and users:
+                key = (t, rid)
+                if key not in res_to_users:
+                    res_to_users[key] = set()
+                for i, u in enumerate(users):
+                    assignments[u].append((t, rid))
+                    res_to_users[key].add(u)
+                    rem_buf[u] -= min(rem_buf[u], rates[i])
+                    if u in su_set:
+                        su_used.add((t, rid))
+    else:
+        # User-order driven (legacy)
+        if user_order is None:
+            user_order = list(range(1, N + 1))
+        resources = {}
+        for t in range(1, T + 1):
+            for rid in RES_SUB[t]:
+                resources[(t, rid)] = [None, set()]
+
+        for user in user_order:
+            if buffer.get(user, 0) <= 0:
+                continue
+            best_fse = -1e9
+            best_res = None
+            for (t, rid), (group, users) in resources.items():
+                if (t, rid) in su_used:
+                    if user not in su_set:
+                        if group is not None and mu_to_group.get(user) != group:
+                            continue
+                    else:
+                        continue
+                candidate = users | {user}
+                n_after = len(candidate)
+                if user in su_set:
+                    if n_after > 1:
+                        continue
+                elif user in mu_to_group:
+                    g = mu_to_group[user]
+                    if any(cu in su_set for cu in candidate):
+                        continue
+                    if any(mu_to_group.get(cu, g) != g for cu in candidate if cu in mu_to_group):
+                        continue
+                fse = compute_fse(user, n_after, t, beam_alloc, CAP, SINR)
+                if cap_lookup(fse) > 0 and fse > best_fse:
+                    best_fse = fse
+                    best_res = (t, rid)
+            if best_res is not None:
+                t, rid = best_res
+                assignments[user].append(best_res)
+                resources[(t, rid)][1].add(user)
+                if user in su_set:
+                    su_used.add((t, rid))
+                elif user in mu_to_group:
+                    resources[(t, rid)][0] = mu_to_group[user]
+
+        for u, res_list in assignments.items():
+            for sub, rid in res_list:
+                key = (sub, rid)
+                if key not in res_to_users:
+                    res_to_users[key] = set()
+                res_to_users[key].add(u)
+
+    return assignments, {}, res_to_users, su_used
 
 
 def fast_improve(assignments, res_to_users, su_used, beam_alloc,
@@ -224,6 +313,82 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
             if (time.perf_counter() - t_start) * 1000 > time_budget_ms:
                 break
 
+        # --- Ruin & Recreate (every 50 iters, skip it=0 to let initial settle) ---
+        if it > 0 and it % 50 == 0:
+            # Ruin: find bottom ~15% users by utilization ratio
+            ratios = [(user_tran_cache[u] / max(1, buffer[u]), u)
+                      for u in range(1, N + 1) if buffer.get(u, 0) > 0 and assignments[u]]
+            if ratios:
+                ratios.sort()
+                n_ruin = max(1, len(ratios) // 6)
+                ruin_users = {u for _, u in ratios[:n_ruin]}
+
+                # Clear their resources
+                for u in ruin_users:
+                    for t, rid in assignments[u]:
+                        key = (t, rid)
+                        if key in res_to_users:
+                            res_to_users[key].discard(u)
+                            if not res_to_users[key]:
+                                del res_to_users[key]
+                    assignments[u] = []
+                    user_tran_cache[u] = 0
+
+                # Recreate: re-allocate cleared users by priority
+                ruin_order = sorted(ruin_users,
+                    key=lambda u: buffer[u] * sum(CAP[u]), reverse=True)
+                for u in ruin_order:
+                    if buffer.get(u, 0) <= 0:
+                        continue
+                    existing = set(assignments[u])
+                    best_cap = -1
+                    best_res = None
+                    for t in range(1, T + 1):
+                        if not beam_alloc.get(t):
+                            continue
+                        for rid in RES_SUB[t]:
+                            if (t, rid) in existing:
+                                continue
+                            key = (t, rid)
+                            cur_users = res_to_users.get(key, set())
+                            n_after = len(cur_users) + 1
+                            if is_su[u]:
+                                if n_after > 1:
+                                    continue
+                            elif u in mu_to_group:
+                                g = mu_to_group[u]
+                                skip = False
+                                for cu in cur_users:
+                                    if is_su[cu]:
+                                        skip = True; break
+                                    if cu in mu_to_group and mu_to_group[cu] != g:
+                                        skip = True; break
+                                if skip:
+                                    continue
+                            new_cap = cap_fast(fse_fast(u, t, n_after))
+                            if new_cap > 0 and new_cap > best_cap:
+                                best_cap = new_cap
+                                best_res = (t, rid)
+                    if best_res is not None:
+                        t, rid = best_res
+                        key = (t, rid)
+                        if key not in res_to_users:
+                            res_to_users[key] = set()
+                        res_to_users[key].add(u)
+                        assignments[u].append((t, rid))
+                        user_tran_cache[u] = min(buffer[u], best_cap)
+
+                # Recalculate all caches (co-user effects from mass reassignment)
+                for u in range(1, N + 1):
+                    if not assignments[u]:
+                        user_tran_cache[u] = 0
+                    else:
+                        bc = 0
+                        for sub, rid in assignments[u]:
+                            n = len(res_to_users.get((sub, rid), {u}))
+                            bc += cap_fast(fse_fast(u, sub, n))
+                        user_tran_cache[u] = min(buffer[u], bc)
+
         best_delta = -1e-9
         best_action = None  # ('add', u, t, rid) or ('swap', u, t_old, rid_old, t_new, rid_new)
 
@@ -275,75 +440,84 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
                             best_delta = delta
                             best_action = (0, u, t, rid)
 
-            # --- Swap (sampled to limit cost) ---
+            # --- Swap (ε-Greedy: 80% greedy top-8, 20% random explore) ---
             if enable_swap and existing:
-                # Pick one random existing resource
-                t_old, rid_old = random.choice(list(existing))
-                old_key = (t_old, rid_old)
-                old_cur = res_to_users.get(old_key, set())
-                n_old_before = len(old_cur)
-                old_u_cap = cap_fast(fse_fast(u, t_old, n_old_before))
+                for t_old, rid_old in existing:
+                    old_key = (t_old, rid_old)
+                    old_cur = res_to_users.get(old_key, set())
+                    n_old_before = len(old_cur)
+                    old_u_cap = cap_fast(fse_fast(u, t_old, n_old_before))
 
-                # Sample candidate resources (full scan too expensive)
-                candidates = [r for r in all_res if r not in existing
-                              and r[0] != t_old]  # exclude same timeslot
-                if len(candidates) > 8:
-                    candidates = random.sample(candidates, 8)
-                for t_new, rid_new in candidates:
-                        new_key = (t_new, rid_new)
-                        new_cur = res_to_users.get(new_key, set())
-                        n_new_before = len(new_cur)
-                        n_new_after = n_new_before + 1
+                    candidates = [r for r in all_res if r not in existing
+                                  and r[0] != t_old]
+                    if len(candidates) > 8:
+                        if random.random() < 0.2:
+                            # Explore: random perturbation to escape local optima
+                            selected = random.sample(candidates, 8)
+                        else:
+                            # Exploit: greedy top-8 by estimated FSE
+                            candidates.sort(
+                                key=lambda tr: fse_fast(u, tr[0],
+                                    len(res_to_users.get(tr, set())) + 1),
+                                reverse=True)
+                            selected = candidates[:8]
+                    else:
+                        selected = candidates
+                    for t_new, rid_new in selected:
+                            new_key = (t_new, rid_new)
+                            new_cur = res_to_users.get(new_key, set())
+                            n_new_before = len(new_cur)
+                            n_new_after = n_new_before + 1
 
-                        # Validate new resource (same rules as add)
-                        if is_su[u]:
-                            if n_new_after > 1:
-                                continue
-                        elif u in mu_to_group:
-                            g = mu_to_group[u]
-                            skip = False
-                            for cu in new_cur:
-                                if is_su[cu]:
-                                    skip = True; break
-                                if cu in mu_to_group and mu_to_group[cu] != g:
-                                    skip = True; break
-                            if skip:
-                                continue
-
-                        new_u_cap = cap_fast(fse_fast(u, t_new, n_new_after))
-
-                        # Delta for user u
-                        delta = (min(buffer[u], old_u_tran - old_u_cap + new_u_cap)
-                                 - old_u_tran)
-
-                        # Co-users on OLD resource gain capacity (u leaves)
-                        n_old_after = n_old_before - 1
-                        if n_old_after > 0:
-                            for cu in old_cur:
-                                if cu == u:
+                            # Validate new resource (same rules as add)
+                            if is_su[u]:
+                                if n_new_after > 1:
                                     continue
-                                old_c = cap_fast(fse_fast(cu, t_old, n_old_before))
-                                new_c = cap_fast(fse_fast(cu, t_old, n_old_after))
-                                if old_c != new_c:
-                                    old_ct = user_tran_cache[cu]
-                                    delta += (min(buffer[cu], old_ct - old_c + new_c)
-                                              - old_ct)
-
-                        # Co-users on NEW resource lose capacity (u joins)
-                        if n_new_before > 0:
-                            for cu in new_cur:
-                                if cu == u:
+                            elif u in mu_to_group:
+                                g = mu_to_group[u]
+                                skip = False
+                                for cu in new_cur:
+                                    if is_su[cu]:
+                                        skip = True; break
+                                    if cu in mu_to_group and mu_to_group[cu] != g:
+                                        skip = True; break
+                                if skip:
                                     continue
-                                old_c = cap_fast(fse_fast(cu, t_new, n_new_before))
-                                new_c = cap_fast(fse_fast(cu, t_new, n_new_after))
-                                if old_c != new_c:
-                                    old_ct = user_tran_cache[cu]
-                                    delta += (min(buffer[cu], old_ct - old_c + new_c)
-                                              - old_ct)
 
-                        if delta > best_delta:
-                            best_delta = delta
-                            best_action = (1, u, t_old, rid_old, t_new, rid_new)
+                            new_u_cap = cap_fast(fse_fast(u, t_new, n_new_after))
+
+                            # Delta for user u
+                            delta = (min(buffer[u], old_u_tran - old_u_cap + new_u_cap)
+                                     - old_u_tran)
+
+                            # Co-users on OLD resource gain capacity (u leaves)
+                            n_old_after = n_old_before - 1
+                            if n_old_after > 0:
+                                for cu in old_cur:
+                                    if cu == u:
+                                        continue
+                                    old_c = cap_fast(fse_fast(cu, t_old, n_old_before))
+                                    new_c = cap_fast(fse_fast(cu, t_old, n_old_after))
+                                    if old_c != new_c:
+                                        old_ct = user_tran_cache[cu]
+                                        delta += (min(buffer[cu], old_ct - old_c + new_c)
+                                                  - old_ct)
+
+                            # Co-users on NEW resource lose capacity (u joins)
+                            if n_new_before > 0:
+                                for cu in new_cur:
+                                    if cu == u:
+                                        continue
+                                    old_c = cap_fast(fse_fast(cu, t_new, n_new_before))
+                                    new_c = cap_fast(fse_fast(cu, t_new, n_new_after))
+                                    if old_c != new_c:
+                                        old_ct = user_tran_cache[cu]
+                                        delta += (min(buffer[cu], old_ct - old_c + new_c)
+                                                  - old_ct)
+
+                            if delta > best_delta:
+                                best_delta = delta
+                                best_action = (1, u, t_old, rid_old, t_new, rid_new)
 
         if best_action is None:
             break
@@ -548,9 +722,8 @@ def format_output(beam_alloc, user_alloc, N):
     return '\n'.join(lines)
 
 
-def make_user_orders(N, buffer, SINR, CAP, MU, SU, seed=42):
-    """生成多种用户优先级排序（按不同评分函数 + 随机）"""
-    rng = random.Random(seed)
+def make_user_orders(N, buffer, SINR, CAP, MU, SU):
+    """生成多种用户优先级排序（8个基础 + 30个系统权重插值，无随机）"""
     tc = {u: sum(CAP[u]) for u in range(1, N + 1)}
     users = [u for u in range(1, N + 1) if buffer[u] > 0]
     orders = []
@@ -577,11 +750,38 @@ def make_user_orders(N, buffer, SINR, CAP, MU, SU, seed=42):
     # 7-8: reverse of first two
     orders.append(list(reversed(orders[0])))
     orders.append(list(reversed(orders[1])))
-    # 9-38: random shuffles (30)
-    for _ in range(30):
-        shuffled = list(users)
-        rng.shuffle(shuffled)
-        orders.append(shuffled)
+
+    # 9-38: systematic weight-interpolated orders (replace random shuffles)
+    buf_max = max(buffer.values()) if buffer else 1
+    cap_avg = {u: sum(CAP[u]) / max(1, len(CAP[u])) for u in users}
+    cap_avg_max = max(cap_avg.values()) if cap_avg else 1
+    sinr_shift = {u: max(-30, min(30, SINR[u])) + 30 for u in users}
+    sinr_max = max(sinr_shift.values()) if sinr_shift else 1
+
+    buf_norm = {u: buffer[u] / buf_max for u in users}
+    cap_norm = {u: cap_avg[u] / cap_avg_max for u in users}
+    sinr_p = {u: sinr_shift[u] / sinr_max for u in users}
+
+    # 10 orders: buffer vs capacity tradeoff
+    for i in range(10):
+        alpha = i / 9.0
+        scored = [(alpha * buf_norm[u] + (1 - alpha) * cap_norm[u], u) for u in users]
+        scored.sort(reverse=True)
+        orders.append([u for _, u in scored])
+
+    # 10 orders: buffer vs SINR tradeoff
+    for i in range(10):
+        beta = i / 9.0
+        scored = [(beta * buf_norm[u] + (1 - beta) * sinr_p[u], u) for u in users]
+        scored.sort(reverse=True)
+        orders.append([u for _, u in scored])
+
+    # 10 orders: capacity vs SINR tradeoff
+    for i in range(10):
+        gamma = i / 9.0
+        scored = [(gamma * cap_norm[u] + (1 - gamma) * sinr_p[u], u) for u in users]
+        scored.sort(reverse=True)
+        orders.append([u for _, u in scored])
 
     return orders
 

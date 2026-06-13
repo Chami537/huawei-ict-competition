@@ -6,10 +6,9 @@ import math
 
 
 class MLP:
-    """全连接神经网络，纯 numpy 实现"""
+    """3 层全连接神经网络，纯 numpy 实现"""
 
-    def __init__(self, input_dim, hidden_dims, output_dim, lr=0.001, momentum=0.9,
-                 seed=42):
+    def __init__(self, input_dim, hidden_dims, output_dim, lr=0.001, momentum=0.9, seed=42):
         np.random.seed(seed)
         self.lr = lr
         self.momentum = momentum
@@ -50,15 +49,16 @@ class MLP:
 
     def backward(self, X, Y, activations, pre_acts):
         batch_size = X.shape[0]
+        grad_w = []
+        grad_b = []
 
         # MSE gradient: 2*(pred - Y) / batch_size
         delta = 2.0 * (activations[-1] - Y) / batch_size
 
-        grad_w = []
-        grad_b = []
         for i in range(len(self.weights) - 1, -1, -1):
             grad_w.insert(0, np.dot(activations[i].T, delta))
             grad_b.insert(0, np.sum(delta, axis=0, keepdims=True))
+
             if i > 0:
                 delta = np.dot(delta, self.weights[i].T) * self._relu_deriv(pre_acts[i - 1])
 
@@ -66,15 +66,15 @@ class MLP:
 
     def update(self, grad_w, grad_b, clip_norm=1.0):
         for i in range(len(self.weights)):
-            gw, gb = grad_w[i], grad_b[i]
-            gw_norm = np.linalg.norm(gw)
+            gw_norm = np.linalg.norm(grad_w[i])
             if gw_norm > clip_norm:
-                gw = gw * (clip_norm / gw_norm)
-            gb_norm = np.linalg.norm(gb)
+                grad_w[i] = grad_w[i] * (clip_norm / gw_norm)
+            gb_norm = np.linalg.norm(grad_b[i])
             if gb_norm > clip_norm:
-                gb = gb * (clip_norm / gb_norm)
-            self.v_w[i] = self.momentum * self.v_w[i] - self.lr * gw
-            self.v_b[i] = self.momentum * self.v_b[i] - self.lr * gb
+                grad_b[i] = grad_b[i] * (clip_norm / gb_norm)
+
+            self.v_w[i] = self.momentum * self.v_w[i] - self.lr * grad_w[i]
+            self.v_b[i] = self.momentum * self.v_b[i] - self.lr * grad_b[i]
             self.weights[i] += self.v_w[i]
             self.biases[i] += self.v_b[i]
 
@@ -96,6 +96,20 @@ class MLP:
         self.biases = [data[f'arr_{i + n}'] for i in range(n)]
         self.v_w = [np.zeros_like(w) for w in self.weights]
         self.v_b = [np.zeros_like(b) for b in self.biases]
+
+
+def load_model(path):
+    """从 .npz 文件推断架构并加载 MLP（无须提前知道 hidden_dims）"""
+    data = np.load(path)
+    n = len(data.files) // 2  # half weights, half biases
+    hidden_dims = []
+    for i in range(n - 1):
+        hidden_dims.append(data[f'arr_{i}'].shape[1])
+    input_dim = data['arr_0'].shape[0]
+    output_dim = data[f'arr_{n - 1}'].shape[1]
+    model = MLP(input_dim, hidden_dims, output_dim)
+    model.load(path)
+    return model
 
 
 def compute_mape_auc(Y_pred, Y_true):
@@ -124,8 +138,7 @@ def train_model(X_train, Y_train, X_val=None, Y_val=None,
                 Y_mean=None, Y_std=None,
                 hidden_dims=None, epochs=200, batch_size=128,
                 lr=0.001, momentum=0.9, patience=20, lr_decay=0.5,
-                lr_decay_epochs=50, model_path=None, seed=42,
-                subsample_ratio=1.0):
+                lr_decay_epochs=50, model_path=None, seed=42):
     """训练 MLP 模型"""
     if hidden_dims is None:
         hidden_dims = [256, 128, 64]
@@ -134,36 +147,27 @@ def train_model(X_train, Y_train, X_val=None, Y_val=None,
     output_dim = Y_train.shape[1]
 
     print(f"Model: input={input_dim}, hidden={hidden_dims}, output={output_dim}")
-    print(f"Training: samples={X_train.shape[0]}, epochs={epochs}, batch_size={batch_size}"
-          f"{f', subsample={subsample_ratio}' if subsample_ratio < 1.0 else ''}")
+    print(f"Training: samples={X_train.shape[0]}, epochs={epochs}, batch_size={batch_size}")
 
     model = MLP(input_dim, hidden_dims, output_dim, lr=lr, momentum=momentum, seed=seed)
 
-    total_samples = X_train.shape[0]
-    rng = np.random.RandomState(seed)
+    n_samples = X_train.shape[0]
+    n_batches = (n_samples + batch_size - 1) // batch_size
 
     best_val_mape_auc = -1.0
     best_epoch = 0
     patience_counter = 0
 
     for epoch in range(epochs):
-        # Subsampling + shuffle
-        if subsample_ratio < 1.0:
-            subsample_n = max(int(total_samples * subsample_ratio), batch_size)
-            epoch_idx = rng.choice(total_samples, subsample_n, replace=False)
-        else:
-            epoch_idx = rng.permutation(total_samples)
-
-        X_shuffled = X_train[epoch_idx]
-        Y_shuffled = Y_train[epoch_idx]
-
-        epoch_n = X_shuffled.shape[0]
-        n_batches = (epoch_n + batch_size - 1) // batch_size
+        # Shuffle
+        indices = np.random.permutation(n_samples)
+        X_shuffled = X_train[indices]
+        Y_shuffled = Y_train[indices]
 
         epoch_mse = 0.0
         for b in range(n_batches):
             start = b * batch_size
-            end = min(start + batch_size, epoch_n)
+            end = min(start + batch_size, n_samples)
             X_batch = X_shuffled[start:end]
             Y_batch = Y_shuffled[start:end]
 
@@ -173,7 +177,7 @@ def train_model(X_train, Y_train, X_val=None, Y_val=None,
 
             epoch_mse += model.compute_mse(activations[-1], Y_batch) * (end - start)
 
-        epoch_mse /= epoch_n
+        epoch_mse /= n_samples
 
         # Learning rate decay
         if (epoch + 1) % lr_decay_epochs == 0:
@@ -233,10 +237,11 @@ if __name__ == '__main__':
         f'{base}/weather.csv', f'{base}/parameter.csv',
     )
 
-    # Time-ordered split: first 90% train, last 10% val
-    split = int(len(X_train) * 0.9)
-    train_idx = np.arange(split)
-    val_idx = np.arange(split, len(X_train))
+    np.random.seed(42)
+    indices = np.random.permutation(len(X_train))
+    split = int(len(indices) * 0.9)
+    train_idx = indices[:split]
+    val_idx = indices[split:]
 
     model = train_model(
         X_train[train_idx], Y_train[train_idx],

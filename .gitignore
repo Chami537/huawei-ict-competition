@@ -7,3 +7,10 @@ __pycache__/
 *~
 .vscode/
 .idea/
+.claude/
+.build/
+CLAUDE.md
+*.exe
+PartA_*.zip
+PartB_*.zip
+Submission.zip

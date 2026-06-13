@@ -63,12 +63,7 @@ def load_weather(path):
             continue
         wt = row[1].strip()
         wt_onehot = [1.0 if wt == w else 0.0 for w in weather_types]
-        numeric = []
-        for v in row[2:]:
-            try:
-                numeric.append(float(v))
-            except (ValueError, TypeError):
-                numeric.append(0.0)
+        numeric = [float(v) for v in row[2:]]
         weather[date_str] = np.array(wt_onehot + numeric, dtype=np.float32)
     return weather
 
@@ -145,8 +140,9 @@ def interpolate_nils(data):
 
 def extract_features(input_records, weather, cell_params, output_hours=24):
     """
-    从输入记录中提取特征向量 (428-dim, 含时间编码)。
-    返回特征向量 (numpy array, float32)。
+    从输入记录中提取特征向量。
+    只提取在训练集中有方差的特征（无 time_encoding/pred_weather）。
+    返回特征向量 (numpy array)。
     """
     metrics_matrix = np.array([[r[1][k] if r[1][k] is not None else 0.0
                                 for k in range(4)] for r in input_records], dtype=np.float32)
@@ -213,20 +209,7 @@ def extract_features(input_records, weather, cell_params, output_hours=24):
     # 6. Recent raw values (last 48 hours for more signal)
     recent_raw = metrics_matrix[-48:].flatten()
 
-    # 7. Time encoding of prediction start
-    last_ts = input_records[-1][0]
-    y, m, d, h = parse_datetime(last_ts)
-    pred_start_h = (h + 1) % 24
-    days_since = date_to_days(y, m, d) - date_to_days(2024, 7, 20)
-    pred_start_dow = (days_since + (1 if h == 23 else 0)) % 7
-    time_encoding = np.array([
-        math.sin(2 * math.pi * pred_start_h / 24),
-        math.cos(2 * math.pi * pred_start_h / 24),
-        math.sin(2 * math.pi * pred_start_dow / 7),
-        math.cos(2 * math.pi * pred_start_dow / 7),
-    ], dtype=np.float32)
-
-    # 8. Weather stats over input period
+    # 7. Weather stats over input period
     weather_vecs = []
     for r in input_records:
         date_str = ts_to_date_str(r[0])
@@ -243,6 +226,28 @@ def extract_features(input_records, weather, cell_params, output_hours=24):
     last24_mean = np.mean(last24, axis=0)
     last24_std = np.std(last24, axis=0)
 
+    # 9. Lag features: for each prediction hour h, get t-24+h and t-168+h raw values
+    lag_features = []
+    input_len = len(input_records)
+    for h in range(output_hours):
+        # Yesterday same hour: position = input_len - 24 + h
+        idx24 = input_len - 24 + h
+        if 0 <= idx24 < input_len:
+            lag24 = [input_records[idx24][1][k] if input_records[idx24][1][k] is not None
+                     else 0.0 for k in range(4)]
+        else:
+            lag24 = [0.0] * 4
+        # Last week same hour: position = input_len - 168 + h
+        idx168 = input_len - 168 + h
+        if 0 <= idx168 < input_len:
+            lag168 = [input_records[idx168][1][k] if input_records[idx168][1][k] is not None
+                      else 0.0 for k in range(4)]
+        else:
+            lag168 = [0.0] * 4
+        lag_features.extend(lag24)
+        lag_features.extend(lag168)
+    lag_features = np.array(lag_features, dtype=np.float32)
+
     # Combine
     X = np.concatenate([
         global_mean, global_std, global_min, global_max,   # 16
@@ -251,22 +256,21 @@ def extract_features(input_records, weather, cell_params, output_hours=24):
         hod_flat,                                            # 96
         dow_flat,                                            # 28
         trends,                                              # 4
-        recent_raw,                                          # 192
+        recent_raw,                                          # 192 (48h×4)
         last24_mean, last24_std,                            # 8
         avg_weather,                                         # 11
         cell_params,                                         # 29
-        time_encoding,                                       # 4
+        lag_features,                                        # 192 (24h × 2 lags × 4 metrics)
     ]).astype(np.float32)
-    # Total: 16+8+32+96+28+4+192+8+11+29+4 = 428 features
+    # Total: 16+8+32+96+28+4+192+8+11+29+192 = 616 features
 
     return X
 
 
 def build_windows(data, weather, param_features, input_hours=336, output_hours=24):
-    """训练集滑动窗口构造 (stride=1, 返回时间戳用于时序排序)"""
+    """训练集滑动窗口构造"""
     samples_x = []
     samples_y = []
-    timestamps = []
 
     for cell, records in data.items():
         if len(records) < input_hours + output_hours:
@@ -287,11 +291,8 @@ def build_windows(data, weather, param_features, input_hours=336, output_hours=2
 
             samples_x.append(X)
             samples_y.append(Y)
-            timestamps.append(records[start + input_hours][0])
 
-    return (np.array(samples_x, dtype=np.float32),
-            np.array(samples_y, dtype=np.float32),
-            timestamps)
+    return np.array(samples_x, dtype=np.float32), np.array(samples_y, dtype=np.float32)
 
 
 def build_test_windows(rows, weather, param_features, input_hours=336):
@@ -381,15 +382,8 @@ def prepare_data(train_path, test_path, weather_path, param_path):
                 break
 
     print("Building training windows...")
-    X_train, Y_train, train_ts = build_windows(train_data, weather, param_features)
-    print(f"  Training samples (raw): {X_train.shape[0]}, features: {X_train.shape[1]}")
-
-    # Sort chronologically for time-ordered split
-    sort_idx = np.argsort([date_to_days(*parse_datetime(ts)[:3]) * 24 + parse_datetime(ts)[3]
-                           for ts in train_ts])
-    X_train = X_train[sort_idx]
-    Y_train = Y_train[sort_idx]
-    print(f"  Training samples (sorted): {X_train.shape[0]}")
+    X_train, Y_train = build_windows(train_data, weather, param_features)
+    print(f"  Training samples: {X_train.shape[0]}, features: {X_train.shape[1]}")
 
     print("Building test windows...")
     X_test, test_meta = build_test_windows(test_rows_clean, weather, param_features)
