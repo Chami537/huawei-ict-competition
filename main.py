@@ -27,7 +27,7 @@ def run_scheduling():
 
     # Fast improve on the single result
     fast_improve(ua, rtu, su, beam_alloc, CAP, SINR, buffer, RES_SUB, N, T, MU, SU,
-                 max_iter=3000, sa_mode=False, enable_swap=False)
+                 max_iter=3000, sa_mode=False, enable_swap=True)
 
     print(format_output(beam_alloc, ua, N))
 

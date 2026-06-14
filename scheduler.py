@@ -307,6 +307,159 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
 
     is_su = {u: u in su_set for u in range(1, N + 1)}
 
+    # --- Dual-User Swap: Snapshot-based (no conditional delta formulas) ---
+    def _try_dual_swap(assignments, res_to_users, user_tran_cache, buffer,
+                       base_fse, cap_fast, fse_fast, all_res,
+                       is_su, mu_to_group, MU, N, T, beam_alloc, RES_SUB):
+        """Try dual-user swaps using snapshot mechanism. Returns (u1, old1, new1, u2, old2, new2) or None."""
+        def _compute_users_tpt(users):
+            total = 0.0
+            for u in users:
+                if not assignments[u]:
+                    continue
+                bc = 0.0
+                for sub, rid in assignments[u]:
+                    n = len(res_to_users.get((sub, rid), {u}))
+                    bc += cap_fast(fse_fast(u, sub, n))
+                total += min(float(buffer[u]), bc)
+            return total
+
+        def _validate_new_res(u, key):
+            """Check if user u can join resource key"""
+            cur_users = res_to_users.get(key, set())
+            n_after = len(cur_users) + 1
+            if is_su[u]:
+                if n_after > 1:
+                    return False
+            elif u in mu_to_group:
+                g = mu_to_group[u]
+                for cu in cur_users:
+                    if is_su[cu]:
+                        return False
+                    if cu in mu_to_group and mu_to_group[cu] != g:
+                        return False
+            return True
+
+        # Build candidate pairs: RU-internal + bottom 10% utilization
+        pairs = []
+        seen_pairs = set()
+        # RU-internal pairs
+        for group in MU:
+            active = [u for u in group if len(assignments[u]) > 0]
+            for i in range(len(active)):
+                for j in range(i + 1, len(active)):
+                    lo, hi = (active[i], active[j]) if active[i] < active[j] else (active[j], active[i])
+                    key = (lo, hi)
+                    if key not in seen_pairs:
+                        seen_pairs.add(key)
+                        pairs.append((lo, hi))
+        # Bottom 10% utilization pairs
+        ratios = [(user_tran_cache[u] / max(1, buffer[u]), u)
+                  for u in range(1, N + 1) if buffer.get(u, 0) > 0 and assignments[u]]
+        if ratios:
+            ratios.sort()
+            cutoff = max(1, len(ratios) // 10)
+            low_users = [u for _, u in ratios[:cutoff]]
+            for i in range(len(low_users)):
+                for j in range(i + 1, len(low_users)):
+                    lo, hi = (low_users[i], low_users[j]) if low_users[i] < low_users[j] else (low_users[j], low_users[i])
+                    key = (lo, hi)
+                    if key not in seen_pairs:
+                        seen_pairs.add(key)
+                        pairs.append((lo, hi))
+
+        # Limit pairs to avoid timeout
+        if len(pairs) > 30:
+            pairs = pairs[:30]
+
+        best_dual = None  # (u1, old1, new1, u2, old2, new2)
+        best_dual_delta = -1e-9
+
+        for u1, u2 in pairs:
+            # Sort each user's resources by contribution (worst first)
+            def _res_score(u, tr):
+                n = len(res_to_users.get(tr, {u}))
+                return cap_fast(fse_fast(u, tr[0], n))
+            res1_sorted = sorted(assignments[u1], key=lambda tr: _res_score(u1, tr))
+            res2_sorted = sorted(assignments[u2], key=lambda tr: _res_score(u2, tr))
+
+            # Try 2 worst resources of each
+            for t1_old, rid1_old in res1_sorted[:2]:
+                for t2_old, rid2_old in res2_sorted[:2]:
+                    # Build candidate new resources for each (top-5 by FSE)
+                    existing1 = set(assignments[u1])
+                    existing2 = set(assignments[u2])
+                    cands1 = [(fse_fast(u1, t, len(res_to_users.get((t, rid), set())) + 1), t, rid)
+                              for t, rid in all_res if (t, rid) not in existing1
+                              and _validate_new_res(u1, (t, rid))]
+                    cands2 = [(fse_fast(u2, t, len(res_to_users.get((t, rid), set())) + 1), t, rid)
+                              for t, rid in all_res if (t, rid) not in existing2
+                              and _validate_new_res(u2, (t, rid))]
+                    cands1.sort(reverse=True)
+                    cands2.sort(reverse=True)
+                    cands1 = [(t, rid) for _, t, rid in cands1[:5]]
+                    cands2 = [(t, rid) for _, t, rid in cands2[:5]]
+                    if not cands1 or not cands2:
+                        continue
+
+                    for t1_new, rid1_new in cands1:
+                        for t2_new, rid2_new in cands2:
+                            # Skip if same resource swap (no-op)
+                            if (t1_old, rid1_old) == (t1_new, rid1_new) and \
+                               (t2_old, rid2_old) == (t2_new, rid2_new):
+                                continue
+
+                            # --- Snapshot: collect affected resources and users ---
+                            old_keys = [(t1_old, rid1_old), (t2_old, rid2_old)]
+                            new_keys = [(t1_new, rid1_new), (t2_new, rid2_new)]
+                            affected_keys = set(old_keys + new_keys)
+                            affected_users = {u1, u2}
+                            for key in affected_keys:
+                                for cu in res_to_users.get(key, set()):
+                                    affected_users.add(cu)
+
+                            old_T = _compute_users_tpt(affected_users)
+
+                            # --- Apply both swaps ---
+                            # Phase 1: Remove old
+                            for u, old_key in [(u1, (t1_old, rid1_old)), (u2, (t2_old, rid2_old))]:
+                                assignments[u].remove(old_key)
+                                if old_key in res_to_users:
+                                    res_to_users[old_key].discard(u)
+                                    if not res_to_users[old_key]:
+                                        del res_to_users[old_key]
+                            # Phase 2: Add new
+                            for u, new_key in [(u1, (t1_new, rid1_new)), (u2, (t2_new, rid2_new))]:
+                                if new_key not in res_to_users:
+                                    res_to_users[new_key] = set()
+                                res_to_users[new_key].add(u)
+                                assignments[u].append(new_key)
+
+                            new_T = _compute_users_tpt(affected_users)
+                            delta = new_T - old_T
+
+                            if delta > best_dual_delta:
+                                best_dual_delta = delta
+                                best_dual = (u1, (t1_old, rid1_old), (t1_new, rid1_new),
+                                             u2, (t2_old, rid2_old), (t2_new, rid2_new))
+
+                            # --- Rollback ---
+                            for u, new_key in [(u1, (t1_new, rid1_new)), (u2, (t2_new, rid2_new))]:
+                                assignments[u].remove(new_key)
+                                if new_key in res_to_users:
+                                    res_to_users[new_key].discard(u)
+                                    if not res_to_users[new_key]:
+                                        del res_to_users[new_key]
+                            for u, old_key in [(u1, (t1_old, rid1_old)), (u2, (t2_old, rid2_old))]:
+                                if old_key not in res_to_users:
+                                    res_to_users[old_key] = set()
+                                res_to_users[old_key].add(u)
+                                assignments[u].append(old_key)
+
+        if best_dual_delta > 1e-9 and best_dual is not None:
+            return best_dual + (best_dual_delta,)
+        return None
+
     for it in range(max_iter):
         # Granular time check (before heavy eval)
         if sa_mode and it % 2 == 0:
@@ -519,6 +672,17 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
                                 best_delta = delta
                                 best_action = (1, u, t_old, rid_old, t_new, rid_new)
 
+        # --- Dual-User Swap (Snapshot mechanism, escape local minima) ---
+        if best_action is None and enable_swap and it % 10 == 5:
+            dual_best = _try_dual_swap(
+                assignments, res_to_users, user_tran_cache, buffer,
+                base_fse, cap_fast, fse_fast, all_res,
+                is_su, mu_to_group, MU, N, T, beam_alloc, RES_SUB)
+            if dual_best is not None:
+                # dual_best = (u1, old1, new1, u2, old2, new2, delta)
+                best_delta = dual_best[-1]
+                best_action = ('dual',) + dual_best[:-1]
+
         if best_action is None:
             break
 
@@ -557,7 +721,7 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
 
             undo_func = _undo_add
 
-        else:  # Swap
+        elif best_action[0] == 1:  # Single swap
             _, u, t_old, rid_old, t_new, rid_new = best_action
             old_key = (t_old, rid_old)
             new_key = (t_new, rid_new)
@@ -624,6 +788,67 @@ def fast_improve(assignments, res_to_users, su_used, beam_alloc,
                     user_tran_cache[cu] = old_v
 
             undo_func = _undo_swap
+
+        elif best_action[0] == 'dual':  # Dual swap (pre-validated by snapshot)
+            _, u1, (t1_old, rid1_old), (t1_new, rid1_new), \
+               u2, (t2_old, rid2_old), (t2_new, rid2_new) = best_action
+
+            # Snapshot user_tran_cache for undo
+            affected_keys = {(t1_old, rid1_old), (t1_new, rid1_new),
+                            (t2_old, rid2_old), (t2_new, rid2_new)}
+            affected_users = {u1, u2}
+            for key in affected_keys:
+                for cu in res_to_users.get(key, set()):
+                    affected_users.add(cu)
+            old_cache = {u: user_tran_cache[u] for u in affected_users}
+            old_assignments = {u: list(assignments[u]) for u in (u1, u2)}
+            old_rtu_snapshot = {}  # res_to_users entries that might be modified
+            for key in affected_keys:
+                if key in res_to_users:
+                    old_rtu_snapshot[key] = set(res_to_users[key])
+
+            # Apply both swaps
+            for u, old_key in [(u1, (t1_old, rid1_old)), (u2, (t2_old, rid2_old))]:
+                assignments[u].remove(old_key)
+                if old_key in res_to_users:
+                    res_to_users[old_key].discard(u)
+                    if not res_to_users[old_key]:
+                        del res_to_users[old_key]
+            for u, new_key in [(u1, (t1_new, rid1_new)), (u2, (t2_new, rid2_new))]:
+                if new_key not in res_to_users:
+                    res_to_users[new_key] = set()
+                res_to_users[new_key].add(u)
+                assignments[u].append(new_key)
+
+            # Recalculate user_tran_cache for affected users
+            for u in affected_users:
+                if not assignments[u]:
+                    user_tran_cache[u] = 0
+                else:
+                    bc = 0.0
+                    for sub, rid in assignments[u]:
+                        n = len(res_to_users.get((sub, rid), {u}))
+                        bc += cap_fast(fse_fast(u, sub, n))
+                    user_tran_cache[u] = min(float(buffer[u]), bc)
+
+            def _undo_dual():
+                # Remove new, restore old
+                for u, new_key in [(u1, (t1_new, rid1_new)), (u2, (t2_new, rid2_new))]:
+                    assignments[u].remove(new_key)
+                    if new_key in res_to_users:
+                        res_to_users[new_key].discard(u)
+                        if not res_to_users[new_key]:
+                            del res_to_users[new_key]
+                for u, old_key in [(u1, (t1_old, rid1_old)), (u2, (t2_old, rid2_old))]:
+                    if old_key not in res_to_users:
+                        res_to_users[old_key] = set()
+                    res_to_users[old_key].add(u)
+                    assignments[u].append(old_key)
+                # Restore caches
+                for u, v in old_cache.items():
+                    user_tran_cache[u] = v
+
+            undo_func = _undo_dual
 
         new_total = sum(user_tran_cache.values())
 
