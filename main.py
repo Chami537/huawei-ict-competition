@@ -27,7 +27,7 @@ def run_scheduling():
 
     # Fast improve on the single result
     fast_improve(ua, rtu, su, beam_alloc, CAP, SINR, buffer, RES_SUB, N, T, MU, SU,
-                 max_iter=3000, sa_mode=False, enable_swap=True)
+                 max_iter=3000, sa_mode=False, enable_swap=False)
 
     print(format_output(beam_alloc, ua, N))
 
@@ -98,6 +98,90 @@ def run_prediction():
     final_pred = np.zeros((N_GROUPS, 24, 4), dtype=np.float64)
     meta = []  # (cell, last_dt) per group
 
+    def predict_one(hist, target_time, m):
+        """Predict a single (cell, hour, metric) point using KNN anchor.
+        Returns (raw_pred, cap)."""
+        tgt = TARGETS[m]
+        prev_day = hist.get((target_time - timedelta(days=1), tgt))
+        prev_week = hist.get((target_time - timedelta(days=7), tgt))
+
+        # Build per-day features for this hour
+        day_feats = []
+        day_vals = []
+        for d in range(1, 15):
+            dt = target_time - timedelta(days=d)
+            dow = dt.weekday()
+            is_wknd = 1.0 if dow >= 5 else 0.0
+            dow_sin = np.sin(2 * np.pi * dow / 7.0)
+            dow_cos = np.cos(2 * np.pi * dow / 7.0)
+            v = hist.get((dt, tgt))
+            day_vals.append(v)
+            day_feats.append((is_wknd, dow_sin, dow_cos))
+
+        tdow = target_time.weekday()
+        t_is_wknd = 1.0 if tdow >= 5 else 0.0
+        t_dow_sin = np.sin(2 * np.pi * tdow / 7.0)
+        t_dow_cos = np.cos(2 * np.pi * tdow / 7.0)
+
+        same_hour = []
+        hist_feats = []
+        for d in range(1, 15):
+            v = day_vals[d - 1]
+            if v is not None:
+                same_hour.append(v)
+                df = day_feats[d - 1]
+                hist_feats.append([df[0], df[1], df[2], 0.0])
+
+        n_sh = len(same_hour)
+        if n_sh < 2:
+            anchor = same_hour[0] if n_sh == 1 else 0.0
+        else:
+            sh_arr = np.array(same_hour, dtype=np.float64)
+            mu, sig = sh_arr.mean(), sh_arr.std()
+            if sig < 1e-6:
+                sig = 1e-6
+            for i in range(n_sh):
+                hist_feats[i][3] = (sh_arr[i] - mu) / sig
+
+            yv = prev_day if prev_day is not None else (same_hour[-1] if same_hour else mu)
+            t_z = (yv - mu) / sig
+            t_feat = np.array([t_is_wknd, t_dow_sin, t_dow_cos, t_z])
+            hf = np.array(hist_feats, dtype=np.float64)
+            hf_scale = hf.std(axis=0) + 1e-6
+            dists = np.sum(((hf - t_feat) / hf_scale) ** 2, axis=1)
+
+            K = min(7, n_sh)
+            k_idx = np.argpartition(dists, K - 1)[:K]
+            knn_vals = np.sort(sh_arr[k_idx])
+            nk = len(knn_vals)
+            q = 0.35
+            p25_val = knn_vals[max(0, int(nk * 0.25))]
+            pq_val = knn_vals[max(0, int(nk * q))]
+            anchor = float(0.3 * p25_val + 0.7 * pq_val)
+
+        p70 = sorted(same_hour)[int(n_sh * 0.70)] if n_sh >= 4 else (anchor * 1.2 if anchor > 0 else 1.0)
+        cap = min(p70, TRAIN_P99[m]) if anchor > 0 else TRAIN_P99[m]
+
+        is_wknd = 1 if tdow >= 5 else 0
+        is_peak = 1 if target_time.hour in (8, 9, 10, 17, 18, 19) else 0
+        if is_wknd:
+            w_pd, w_pw = (0.55, 0.45) if is_peak else (0.45, 0.55)
+        else:
+            w_pd, w_pw = (0.65, 0.35) if is_peak else (0.50, 0.50)
+
+        pieces = []
+        if prev_day is not None:
+            pieces.append((w_pd, prev_day))
+        if prev_week is not None:
+            pieces.append((w_pw, prev_week))
+        trend = anchor
+        if pieces:
+            wsum = sum(w for w, _ in pieces)
+            trend = sum(w * v for w, v in pieces) / wsum
+
+        pred = 0.80 * anchor + 0.20 * trend
+        return pred, cap
+
     for g in range(N_GROUPS):
         block = rows[g * GROUP:(g + 1) * GROUP]
         cell = block[0][1]
@@ -112,101 +196,29 @@ def run_prediction():
                 if v is not None:
                     hist[(t, tgt)] = v
 
-        for h in range(24):
-            target_time = last_dt + timedelta(hours=h + 1)
-            # Build per-day features for this hour (shared across metrics)
-            day_feats = []  # list of (dow, is_wknd, z_vals_for_4metrics)
-            day_vals = [[] for _ in range(4)]  # per-metric values for 14 days
-            for d in range(1, 15):
-                dt = target_time - timedelta(days=d)
-                dow = dt.weekday()
-                is_wknd = 1.0 if dow >= 5 else 0.0
-                dow_sin = np.sin(2 * np.pi * dow / 7.0)
-                dow_cos = np.cos(2 * np.pi * dow / 7.0)
-                vals = []
-                for m in range(4):
-                    v = hist.get((dt, TARGETS[m]))
-                    day_vals[m].append(v)
-                    vals.append(v if v is not None else np.nan)
-                day_feats.append((dow, is_wknd, dow_sin, dow_cos, vals))
+        for m in range(4):
+            # 1) Compute per-cell correction using the last 3 observed days
+            ratios = []
+            for day_offset in range(3, 0, -1):
+                for h in range(24):
+                    target_time = last_dt - timedelta(days=day_offset, hours=23 - h)
+                    actual = hist.get((target_time, TARGETS[m]))
+                    if actual is None:
+                        continue
+                    pred, _ = predict_one(hist, target_time, m)
+                    if pred > 1e-6:
+                        ratios.append(actual / pred)
+            if ratios:
+                correction = float(np.median(np.array(ratios)))
+                correction = max(0.8, min(1.2, correction))
+            else:
+                correction = 1.0
 
-            # Target day features
-            tdow = target_time.weekday()
-            t_is_wknd = 1.0 if tdow >= 5 else 0.0
-            t_dow_sin = np.sin(2 * np.pi * tdow / 7.0)
-            t_dow_cos = np.cos(2 * np.pi * tdow / 7.0)
-
-            for m in range(4):
-                tgt = TARGETS[m]
-                prev_day = hist.get((target_time - timedelta(days=1), tgt))
-                prev_week = hist.get((target_time - timedelta(days=7), tgt))
-
-                # Collect same-hour values + build KNN features
-                same_hour = []
-                hist_feats = []  # (n_valid, 4): [is_wknd, dow_sin, dow_cos, z_val]
-                for d in range(1, 15):
-                    v = day_vals[m][d - 1]
-                    if v is not None:
-                        same_hour.append(v)
-                        df = day_feats[d - 1]
-                        hist_feats.append([df[1], df[2], df[3], 0.0])  # z_val filled below
-
-                n_sh = len(same_hour)
-                if n_sh < 2:
-                    anchor = same_hour[0] if n_sh == 1 else 0.0
-                else:
-                    sh_arr = np.array(same_hour, dtype=np.float64)
-                    mu, sig = sh_arr.mean(), sh_arr.std()
-                    if sig < 1e-6:
-                        sig = 1e-6
-                    # Fill z-score column
-                    for i in range(n_sh):
-                        hist_feats[i][3] = (sh_arr[i] - mu) / sig
-
-                    # Target: yesterday's z-score captures recent trend
-                    yv = prev_day if prev_day is not None else (same_hour[-1] if same_hour else mu)
-                    t_z = (yv - mu) / sig
-                    t_feat = np.array([t_is_wknd, t_dow_sin, t_dow_cos, t_z])
-                    hf = np.array(hist_feats, dtype=np.float64)
-
-                    # Normalize features (per-column std)
-                    hf_scale = hf.std(axis=0) + 1e-6
-                    dists = np.sum(((hf - t_feat) / hf_scale) ** 2, axis=1)
-
-                    K = min(7, n_sh)
-                    k_idx = np.argpartition(dists, K - 1)[:K]
-                    # Interpolate between p25 and p35 for fine-grained control
-                    knn_vals = np.sort(sh_arr[k_idx])
-                    nk = len(knn_vals)
-                    p25_val = knn_vals[max(0, int(nk * 0.25))]
-                    p35_val = knn_vals[max(0, int(nk * 0.35))]
-                    anchor = float(0.3 * p25_val + 0.7 * p35_val)
-
-                # Cap: min(local_p70, train_p99)
-                p70 = sorted(same_hour)[int(n_sh * 0.70)] if n_sh >= 4 else (anchor * 1.2 if anchor > 0 else 1.0)
-                cap = min(p70, TRAIN_P99[m]) if anchor > 0 else TRAIN_P99[m]
-
-                # Trend signal
-                is_wknd = 1 if tdow >= 5 else 0
-                is_peak = 1 if target_time.hour in (8, 9, 10, 17, 18, 19) else 0
-                if is_wknd:
-                    w_pd, w_pw = (0.55, 0.45) if is_peak else (0.45, 0.55)
-                else:
-                    w_pd, w_pw = (0.65, 0.35) if is_peak else (0.50, 0.50)
-
-                pieces = []
-                if prev_day is not None:
-                    pieces.append((w_pd, prev_day))
-                if prev_week is not None:
-                    pieces.append((w_pw, prev_week))
-                trend = anchor
-                if pieces:
-                    wsum = sum(w for w, _ in pieces)
-                    trend = sum(w * v for w, v in pieces) / wsum
-
-                pred = 0.80 * anchor + 0.20 * trend
-                pred = max(0.0001, min(pred, cap))
-                final_pred[g, h, m] = pred
+            # 2) Predict the next 24h and apply correction
+            for h in range(24):
+                target_time = last_dt + timedelta(hours=h + 1)
+                pred, cap = predict_one(hist, target_time, m)
+                final_pred[g, h, m] = max(0.0001, min(pred * correction, cap))
 
     print(f"Final mean={final_pred.mean():.4f}")
 

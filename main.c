@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
 /* Simple xorshift RNG for deterministic reproducible mutations */
 static unsigned int rng_state = 2463534242u;
@@ -83,24 +82,6 @@ static int best_al_cnt[MAXN], best_al_sub[MAXN][MAXK], best_al_res[MAXN][MAXK];
 
 static double db_share[12];      /* lin2db(1/s), s=1..10 */
 
-/* Rate lookup table: precomputed cap_rate(SINR + penalty[s] + beamGain) for O(1) access */
-static int rate_tbl[MAXN+1][MAXT+1][11];  /* [user][subband][1..10], idx=0 always 0 */
-
-static void compute_rate_table(void) {
-    for (int u = 1; u <= N; u++) {
-        for (int t = 1; t <= T; t++) {
-            rate_tbl[u][t][0] = 0;
-            if (G[u][t] <= -1e17) {
-                for (int s = 1; s <= 10; s++) rate_tbl[u][t][s] = 0;
-                continue;
-            }
-            for (int s = 1; s <= 10; s++) {
-                rate_tbl[u][t][s] = cap_rate(sinr[u] + db_share[s] + G[u][t]);
-            }
-        }
-    }
-}
-
 static void sort_beams_by_score(double *score) {
     for (int p = 1; p <= P; p++) pop_order[p - 1] = p;
     for (int a = 0; a < P; a++)
@@ -162,30 +143,37 @@ static void compute_mupot(void) {
     }
     sort_beams_by_score(score);
 }
+
+/* ---------- 辅助全局数组（避免大数组栈分配） ---------- */
+static int cocount[MAXT + 1][MAXK + 1];
+
 /* Strategy 4: MU-group weighted — average per-RU contribution, fallback to global */
 static void compute_mubeam(void) {
     double score[MAXP];
     for (int p = 1; p <= P; p++) {
         score[p] = 0.0;
         for (int m = 0; m < M; m++) {
-            double gs = 0.0;
+            double gs = 0.0; int cnt = 0;
             for (int j = 0; j < ru_sz[m]; j++) {
                 int u = ru[m][j];
-                if (buf[u] <= 0) continue;
-                gs += (Sall[u] > 1e-9) ? sqrt((double)buf[u]) * CAP[u][p] / Sall[u] : 0.0;
+                if (buf[u] <= 0 || Sall[u] < 1e-9) continue;
+                gs += buf[u] * CAP[u][p] / Sall[u];
+                cnt++;
             }
-            if (ru_sz[m] > 0) score[p] += gs / ru_sz[m];
+            if (cnt > 0) score[p] += gs / cnt;
         }
-        if (score[p] <= 1e-9) {  /* fallback to global popularity */
+        if (score[p] <= 1e-9) {
             for (int u = 1; u <= N; u++)
                 score[p] += (Sall[u] > 1e-9) ? CAP[u][p] / Sall[u] : 0.0;
         }
     }
     sort_beams_by_score(score);
 }
+
 /* Strategy 5: SU-only weighted — reward beams preferred by non-MU users */
 static void compute_suonly(void) {
-    int isMU[MAXN+1] = {0};
+    static int isMU[MAXN + 1];
+    memset(isMU, 0, sizeof(isMU));
     for (int m = 0; m < M; m++)
         for (int j = 0; j < ru_sz[m]; j++)
             isMU[ru[m][j]] = 1;
@@ -193,10 +181,10 @@ static void compute_suonly(void) {
     for (int p = 1; p <= P; p++) {
         score[p] = 0.0;
         for (int u = 1; u <= N; u++) {
-            if (isMU[u] || buf[u] <= 0) continue;
-            score[p] += (Sall[u] > 1e-9) ? sqrt((double)buf[u]) * CAP[u][p] / Sall[u] : 0.0;
+            if (isMU[u] || buf[u] <= 0 || Sall[u] < 1e-9) continue;
+            score[p] += buf[u] * CAP[u][p] / Sall[u];
         }
-        if (score[p] <= 1e-9) {  /* fallback if no SU users */
+        if (score[p] <= 1e-9) {
             for (int u = 1; u <= N; u++)
                 score[p] += (Sall[u] > 1e-9) ? CAP[u][p] / Sall[u] : 0.0;
         }
@@ -257,8 +245,8 @@ static void compute_gain(void) {
 }
 
 static double rate_of(int i, int t, int s) {
-    if (s < 1) s = 1; else if (s > 10) s = 10;
-    return (double)rate_tbl[i][t][s];
+    if (G[i][t] <= -1e17) return 0.0;
+    return (double)cap_rate(sinr[i] + db_share[s] + G[i][t]);
 }
 
 /* 在子带 t 用一个 res，求最佳配置；返回边际增益，chosen[]/cr[] 填充用户与其获得速率 */
@@ -306,7 +294,6 @@ static double best_config(int t, int *chosen, double *cr, int *ncho) {
 static double run_greedy(void) {
     for (int i = 1; i <= N; i++) { rem[i] = (double)buf[i]; al_cnt[i] = 0; }
     compute_gain();
-    compute_rate_table();
     /* res 列表，按所属子带波束数降序处理 */
     int reslist[MAXK], rcnt = 0;
     for (int t = 1; t <= T; t++)
@@ -342,13 +329,8 @@ int main(void) {
         scanf("%d", &ru_sz[m]);
         for (int j = 0; j < ru_sz[m]; j++) scanf("%d", &ru[m][j]);
     }
-    int su_sz, is_su[MAXN+1] = {0}; scanf("%d", &su_sz);
-    for (int j = 0; j < su_sz; j++) { int x; scanf("%d", &x); is_su[x] = 1; }
-    int mu_group[MAXN+1];
-    for (int i = 1; i <= N; i++) mu_group[i] = -1;
-    for (int m = 0; m < M; m++)
-        for (int j = 0; j < ru_sz[m]; j++)
-            mu_group[ru[m][j]] = m;
+    int su_sz; scanf("%d", &su_sz);
+    for (int j = 0; j < su_sz; j++) { int x; scanf("%d", &x); }  /* SU 仅独占，算法中按单用户处理，读入跳过 */
     for (int i = 1; i <= N; i++) {
         Sall[i] = 0.0;
         for (int p = 1; p <= P; p++) { scanf("%lf", &CAP[i][p]); Sall[i] += CAP[i][p]; }
@@ -365,8 +347,9 @@ int main(void) {
     int Amax = T < beamMax ? T : beamMax; if (Amax < 1) Amax = 1;
     double bestT = -1.0;
 
-    /* 4 beam ranking strategies */
-    void (*strategies[6])(void) = {compute_pop, compute_marginal, compute_balanced, compute_mupot, compute_mubeam, compute_suonly};
+    /* 6 beam ranking strategies */
+    void (*strategies[6])(void) = {compute_pop, compute_marginal, compute_balanced,
+                                   compute_mupot, compute_mubeam, compute_suonly};
     for (int strat = 0; strat < 6; strat++) {
         strategies[strat]();
 
@@ -391,7 +374,12 @@ int main(void) {
             }
         }
         compute_gain();
-        compute_rate_table();
+
+        /* Build cocount cache: cocount[t][rid] = number of users on (t, rid) */
+        memset(cocount, 0, sizeof(cocount));
+        for (int u = 1; u <= N; u++)
+            for (int j = 0; j < al_cnt[u]; j++)
+                cocount[al_sub[u][j]][al_res[u][j]]++;
 
         for (int iter = 0; iter < 100; iter++) {
             /* Find worst user by utilization ratio */
@@ -402,10 +390,7 @@ int main(void) {
                 double tran = 0.0;
                 for (int j = 0; j < al_cnt[u]; j++) {
                     int t = al_sub[u][j], rid = al_res[u][j];
-                    int n = 0;
-                    for (int u2 = 1; u2 <= N; u2++)
-                        for (int k = 0; k < al_cnt[u2]; k++)
-                            if (al_sub[u2][k] == t && al_res[u2][k] == rid) n++;
+                    int n = cocount[t][rid];
                     double r = rate_of(u, t, n);
                     tran += r < (buf[u] - tran) ? r : (buf[u] - tran);
                 }
@@ -420,10 +405,7 @@ int main(void) {
                 for (int _j = 0; _j < al_cnt[uu]; _j++) { \
                     int _t = alist##_sub[uu][_j], _rid = alist##_res[uu][_j]; \
                     if (_t == nt_old && _rid == nrid_old && uu == worst) continue; \
-                    int _n = 0; \
-                    for (int _u2 = 1; _u2 <= N; _u2++) \
-                        for (int _k = 0; _k < al_cnt[_u2]; _k++) \
-                            if (alist##_sub[_u2][_k] == _t && alist##_res[_u2][_k] == _rid) _n++; \
+                    int _n = cocount[_t][_rid]; \
                     if (_t == nt_old && _rid == nrid_old) _n--; \
                     if (_t == nt_new && _rid == nrid_new) _n++; \
                     double _r = rate_of(uu, _t, _n); \
@@ -482,16 +464,17 @@ int main(void) {
                         break;
                     }
                 }
+                /* Update cocount cache */
+                cocount[best_ot][best_orid]--;
+                cocount[best_nt][best_nrid]++;
+
                 /* Update best if improved (full recalc) */
                 double newT = 0.0;
                 for (int i = 1; i <= N; i++) {
                     double tran = 0.0;
                     for (int j = 0; j < al_cnt[i]; j++) {
                         int ti = al_sub[i][j], ri = al_res[i][j];
-                        int n = 0;
-                        for (int u2 = 1; u2 <= N; u2++)
-                            for (int k = 0; k < al_cnt[u2]; k++)
-                                if (al_sub[u2][k] == ti && al_res[u2][k] == ri) n++;
+                        int n = cocount[ti][ri];
                         double r = rate_of(i, ti, n);
                         tran += r < (buf[i] - tran) ? r : (buf[i] - tran);
                     }
@@ -500,242 +483,6 @@ int main(void) {
                 if (newT > bestT) { bestT = newT; save_best(newT, &bestT); }
             } else break;
         }
-
-        /* ---- Dual-User Swap (snapshot-based, pruned enumeration) ---- */
-        {
-            #define CNT_USR(sb, rid) ({ \
-                int _c = 0; for (int _u = 1; _u <= N; _u++) \
-                    for (int _j = 0; _j < al_cnt[_u]; _j++) \
-                        if (al_sub[_u][_j] == (sb) && al_res[_u][_j] == (rid)) _c++; \
-                _c; \
-            })
-            #define U_TPUT(uu) ({ \
-                double _tran = 0.0; \
-                for (int _j = 0; _j < al_cnt[uu]; _j++) { \
-                    int _t = al_sub[uu][_j], _r = al_res[uu][_j]; \
-                    int _n = CNT_USR(_t, _r); \
-                    double _rate = rate_of(uu, _t, _n); \
-                    double _add = (_rate < (buf[uu] - _tran)) ? _rate : (buf[uu] - _tran); \
-                    _tran += _add; \
-                } \
-                (_tran < buf[uu]) ? _tran : (double)buf[uu]; \
-            })
-
-            /* Resource candidate for new assignment */
-            struct rcand { int sub, rid; double fse; };
-
-            /* Precompute top-3 new-resource candidates per user */
-            struct rcand new_cands[MAXN+1][5]; int nc[MAXN+1];
-            for (int u = 1; u <= N; u++) {
-                if (al_cnt[u] == 0) { nc[u] = 0; continue; }
-                int cnt = 0; struct rcand tmp[50];
-                for (int t = 1; t <= T; t++) {
-                    if (beams_cnt[t] == 0) continue;
-                    for (int j = 0; j < rsub_sz[t]; j++) {
-                        int rid = rsub[t][j], already = 0;
-                        for (int k = 0; k < al_cnt[u]; k++)
-                            if (al_sub[u][k] == t && al_res[u][k] == rid) { already = 1; break; }
-                        if (already) continue;
-                        int n = CNT_USR(t, rid);
-                        /* Validate: SU must be alone, MU must be same group */
-                        if (is_su[u] && n > 0) continue;
-                        if (!is_su[u] && mu_group[u] >= 0 && n > 0) {
-                            int ok = 1, g = mu_group[u];
-                            for (int uu = 1; uu <= N && ok; uu++)
-                                for (int kk = 0; kk < al_cnt[uu]; kk++)
-                                    if (al_sub[uu][kk] == t && al_res[uu][kk] == rid)
-                                        if (mu_group[uu] != g) { ok = 0; break; }
-                            if (!ok) continue;
-                        }
-                        tmp[cnt].sub = t; tmp[cnt].rid = rid;
-                        tmp[cnt].fse = rate_of(u, t, n + 1); cnt++;
-                    }
-                }
-                for (int a = 0; a < cnt; a++)
-                    for (int b = a + 1; b < cnt; b++)
-                        if (tmp[b].fse > tmp[a].fse) { struct rcand t = tmp[a]; tmp[a] = tmp[b]; tmp[b] = t; }
-                int take = cnt < 3 ? cnt : 3;
-                for (int i = 0; i < take; i++) new_cands[u][i] = tmp[i];
-                nc[u] = take;
-            }
-
-            /* Build candidate pairs: RU-internal + bottom-10% utilization */
-            int pair_u1[400], pair_u2[400], pair_cnt = 0;
-            /* RU-internal */
-            for (int m = 0; m < M; m++)
-                for (int a = 0; a < ru_sz[m]; a++)
-                    for (int b = a + 1; b < ru_sz[m]; b++) {
-                        int u1 = ru[m][a], u2 = ru[m][b];
-                        if (al_cnt[u1] == 0 || al_cnt[u2] == 0) continue;
-                        if (is_su[u1] || is_su[u2]) continue;
-                        if (pair_cnt < 400) { pair_u1[pair_cnt] = u1; pair_u2[pair_cnt] = u2; pair_cnt++; }
-                    }
-            /* Bottom-10% by utilization ratio */
-            {
-                struct { double ratio; int u; } ur[MAXN]; int urc = 0;
-                for (int u = 1; u <= N; u++) {
-                    if (buf[u] <= 0 || al_cnt[u] == 0 || is_su[u]) continue;
-                    ur[urc].u = u; ur[urc].ratio = U_TPUT(u) / (double)buf[u]; urc++;
-                }
-                for (int a = 0; a < urc; a++)
-                    for (int b = a + 1; b < urc; b++)
-                        if (ur[b].ratio < ur[a].ratio) { typeof(ur[0]) t = ur[a]; ur[a] = ur[b]; ur[b] = t; }
-                int cutoff = urc / 10; if (cutoff < 2) cutoff = 2;
-                for (int a = 0; a < cutoff && pair_cnt < 400; a++)
-                    for (int b = a + 1; b < cutoff && pair_cnt < 400; b++) {
-                        pair_u1[pair_cnt] = ur[a].u; pair_u2[pair_cnt] = ur[b].u; pair_cnt++;
-                    }
-            }
-
-            double best_dgain = 0.0;
-            int b_u1 = 0, b_o1s = 0, b_o1r = 0, b_n1s = 0, b_n1r = 0;
-            int b_u2 = 0, b_o2s = 0, b_o2r = 0, b_n2s = 0, b_n2r = 0;
-
-            for (int pi = 0; pi < pair_cnt; pi++) {
-                int u1 = pair_u1[pi], u2 = pair_u2[pi];
-
-                /* Sort resources by contribution (worst first) */
-                struct { int sub, rid; double c; } r1[10], r2[10];
-                int n1 = 0, n2 = 0;
-                for (int j = 0; j < al_cnt[u1]; j++) {
-                    int t = al_sub[u1][j], rid = al_res[u1][j];
-                    r1[n1].sub = t; r1[n1].rid = rid;
-                    r1[n1].c = rate_of(u1, t, CNT_USR(t, rid)); n1++;
-                }
-                for (int j = 0; j < al_cnt[u2]; j++) {
-                    int t = al_sub[u2][j], rid = al_res[u2][j];
-                    r2[n2].sub = t; r2[n2].rid = rid;
-                    r2[n2].c = rate_of(u2, t, CNT_USR(t, rid)); n2++;
-                }
-                for (int a = 0; a < n1; a++) for (int b = a+1; b < n1; b++) if (r1[b].c < r1[a].c) { typeof(r1[0]) t = r1[a]; r1[a] = r1[b]; r1[b] = t; }
-                for (int a = 0; a < n2; a++) for (int b = a+1; b < n2; b++) if (r2[b].c < r2[a].c) { typeof(r2[0]) t = r2[a]; r2[a] = r2[b]; r2[b] = t; }
-
-                int t1 = n1 < 2 ? n1 : 2, t2 = n2 < 2 ? n2 : 2;
-
-                for (int oi1 = 0; oi1 < t1; oi1++) {
-                    int o1s = r1[oi1].sub, o1r = r1[oi1].rid;
-                    for (int oi2 = 0; oi2 < t2; oi2++) {
-                        int o2s = r2[oi2].sub, o2r = r2[oi2].rid;
-
-                        for (int ci1 = 0; ci1 < nc[u1]; ci1++) {
-                            int n1s = new_cands[u1][ci1].sub, n1r = new_cands[u1][ci1].rid;
-                            for (int ci2 = 0; ci2 < nc[u2]; ci2++) {
-                                int n2s = new_cands[u2][ci2].sub, n2r = new_cands[u2][ci2].rid;
-
-                                /* Collect affected resource keys (max 4, dedup) */
-                                struct { int sub, rid; } keys[4]; int nk = 0;
-                                #define ADDK(s, r) do { \
-                                    int _d = 0; \
-                                    for (int _k = 0; _k < nk; _k++) \
-                                        if (keys[_k].sub == (s) && keys[_k].rid == (r)) { _d = 1; break; } \
-                                    if (!_d) { keys[nk].sub = (s); keys[nk].rid = (r); nk++; } \
-                                } while(0)
-                                ADDK(o1s, o1r); ADDK(n1s, n1r);
-                                ADDK(o2s, o2r); ADDK(n2s, n2r);
-
-                                /* Compute old_T for affected users */
-                                double old_T = 0.0; int cnted[MAXN+1] = {0};
-                                for (int ki = 0; ki < nk; ki++) {
-                                    for (int u = 1; u <= N; u++) {
-                                        if (cnted[u]) continue;
-                                        int on = 0;
-                                        for (int j = 0; j < al_cnt[u]; j++)
-                                            if (al_sub[u][j] == keys[ki].sub && al_res[u][j] == keys[ki].rid) { on = 1; break; }
-                                        if (!on) continue;
-                                        cnted[u] = 1; old_T += U_TPUT(u);
-                                    }
-                                }
-
-                                /* Apply both swaps */
-                                /* Remove old: shift-left in al arrays */
-                                for (int j = 0; j < al_cnt[u1]; j++)
-                                    if (al_sub[u1][j] == o1s && al_res[u1][j] == o1r) {
-                                        for (int k = j; k < al_cnt[u1]-1; k++) { al_sub[u1][k] = al_sub[u1][k+1]; al_res[u1][k] = al_res[u1][k+1]; }
-                                        al_cnt[u1]--; break;
-                                    }
-                                for (int j = 0; j < al_cnt[u2]; j++)
-                                    if (al_sub[u2][j] == o2s && al_res[u2][j] == o2r) {
-                                        for (int k = j; k < al_cnt[u2]-1; k++) { al_sub[u2][k] = al_sub[u2][k+1]; al_res[u2][k] = al_res[u2][k+1]; }
-                                        al_cnt[u2]--; break;
-                                    }
-                                /* Add new */
-                                al_sub[u1][al_cnt[u1]] = n1s; al_res[u1][al_cnt[u1]] = n1r; al_cnt[u1]++;
-                                al_sub[u2][al_cnt[u2]] = n2s; al_res[u2][al_cnt[u2]] = n2r; al_cnt[u2]++;
-
-                                /* Compute new_T */
-                                double new_T = 0.0; int cnted2[MAXN+1] = {0};
-                                for (int ki = 0; ki < nk; ki++) {
-                                    for (int u = 1; u <= N; u++) {
-                                        if (cnted2[u]) continue;
-                                        int on = 0;
-                                        for (int j = 0; j < al_cnt[u]; j++)
-                                            if (al_sub[u][j] == keys[ki].sub && al_res[u][j] == keys[ki].rid) { on = 1; break; }
-                                        if (!on) continue;
-                                        cnted2[u] = 1; new_T += U_TPUT(u);
-                                    }
-                                }
-
-                                double delta = new_T - old_T;
-                                if (delta > best_dgain) {
-                                    best_dgain = delta;
-                                    b_u1 = u1; b_o1s = o1s; b_o1r = o1r; b_n1s = n1s; b_n1r = n1r;
-                                    b_u2 = u2; b_o2s = o2s; b_o2r = o2r; b_n2s = n2s; b_n2r = n2r;
-                                }
-
-                                /* Rollback: remove new, restore old */
-                                for (int j = 0; j < al_cnt[u1]; j++)
-                                    if (al_sub[u1][j] == n1s && al_res[u1][j] == n1r) {
-                                        for (int k = j; k < al_cnt[u1]-1; k++) { al_sub[u1][k] = al_sub[u1][k+1]; al_res[u1][k] = al_res[u1][k+1]; }
-                                        al_cnt[u1]--; break;
-                                    }
-                                for (int j = 0; j < al_cnt[u2]; j++)
-                                    if (al_sub[u2][j] == n2s && al_res[u2][j] == n2r) {
-                                        for (int k = j; k < al_cnt[u2]-1; k++) { al_sub[u2][k] = al_sub[u2][k+1]; al_res[u2][k] = al_res[u2][k+1]; }
-                                        al_cnt[u2]--; break;
-                                    }
-                                al_sub[u1][al_cnt[u1]] = o1s; al_res[u1][al_cnt[u1]] = o1r; al_cnt[u1]++;
-                                al_sub[u2][al_cnt[u2]] = o2s; al_res[u2][al_cnt[u2]] = o2r; al_cnt[u2]++;
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* Apply best dual swap if found */
-            if (best_dgain > 1e-9) {
-                int u1 = b_u1, u2 = b_u2;
-                for (int j = 0; j < al_cnt[u1]; j++)
-                    if (al_sub[u1][j] == b_o1s && al_res[u1][j] == b_o1r) {
-                        for (int k = j; k < al_cnt[u1]-1; k++) { al_sub[u1][k] = al_sub[u1][k+1]; al_res[u1][k] = al_res[u1][k+1]; }
-                        al_cnt[u1]--; break;
-                    }
-                for (int j = 0; j < al_cnt[u2]; j++)
-                    if (al_sub[u2][j] == b_o2s && al_res[u2][j] == b_o2r) {
-                        for (int k = j; k < al_cnt[u2]-1; k++) { al_sub[u2][k] = al_sub[u2][k+1]; al_res[u2][k] = al_res[u2][k+1]; }
-                        al_cnt[u2]--; break;
-                    }
-                al_sub[u1][al_cnt[u1]] = b_n1s; al_res[u1][al_cnt[u1]] = b_n1r; al_cnt[u1]++;
-                al_sub[u2][al_cnt[u2]] = b_n2s; al_res[u2][al_cnt[u2]] = b_n2r; al_cnt[u2]++;
-
-                double newT = 0.0;
-                for (int i = 1; i <= N; i++) {
-                    double tran = 0.0;
-                    for (int j = 0; j < al_cnt[i]; j++) {
-                        int ti = al_sub[i][j], ri = al_res[i][j], n = 0;
-                        for (int uu = 1; uu <= N; uu++)
-                            for (int k = 0; k < al_cnt[uu]; k++)
-                                if (al_sub[uu][k] == ti && al_res[uu][k] == ri) n++;
-                        double r = rate_of(i, ti, n);
-                        tran += r < (buf[i] - tran) ? r : (buf[i] - tran);
-                    }
-                    newT += tran < buf[i] ? tran : buf[i];
-                }
-                if (newT > bestT) { bestT = newT; save_best(newT, &bestT); }
-            }
-            #undef CNT_USR
-            #undef U_TPUT
-        }
-
     }
 
     /* 输出：T 行子带波束 + N 行用户资源 */
