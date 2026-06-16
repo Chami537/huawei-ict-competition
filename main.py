@@ -154,7 +154,11 @@ def run_prediction():
             k_idx = np.argpartition(dists, K - 1)[:K]
             knn_vals = np.sort(sh_arr[k_idx])
             nk = len(knn_vals)
-            q = 0.35
+            # 潮汐分离探针: 工作日拔高基准(q=0.40), 周末压低基准(q=0.25)
+            if tdow >= 5:
+                q = 0.25
+            else:
+                q = 0.40
             p25_val = knn_vals[max(0, int(nk * 0.25))]
             pq_val = knn_vals[max(0, int(nk * q))]
             anchor = float(0.3 * p25_val + 0.7 * pq_val)
@@ -197,9 +201,10 @@ def run_prediction():
                     hist[(t, tgt)] = v
 
         for m in range(4):
-            # 1) Compute per-cell correction using the last 3 observed days
-            ratios = []
-            for day_offset in range(3, 0, -1):
+            # 1) Smoothed correction: 2-day backtest weighted avg + tightened clip
+            corrections = []
+            for day_offset in range(1, 3):  # day 1 (yesterday) and day 2
+                ratios = []
                 for h in range(24):
                     target_time = last_dt - timedelta(days=day_offset, hours=23 - h)
                     actual = hist.get((target_time, TARGETS[m]))
@@ -208,11 +213,18 @@ def run_prediction():
                     pred, _ = predict_one(hist, target_time, m)
                     if pred > 1e-6:
                         ratios.append(actual / pred)
-            if ratios:
-                correction = float(np.median(np.array(ratios)))
-                correction = max(0.8, min(1.2, correction))
+                if ratios:
+                    corrections.append((float(np.median(np.array(ratios))), day_offset))
+            if len(corrections) >= 2:
+                # 0.6 * day1 + 0.4 * day2 (weighted towards recent)
+                c1 = corrections[0][0]  # day 1
+                c2 = corrections[1][0]  # day 2
+                correction = 0.6 * c1 + 0.4 * c2
+            elif len(corrections) == 1:
+                correction = corrections[0][0]
             else:
                 correction = 1.0
+            correction = max(0.85, min(1.15, correction))
 
             # 2) Predict the next 24h and apply correction
             for h in range(24):
