@@ -24,7 +24,6 @@
 
 /* Simple xorshift RNG for deterministic reproducible mutations */
 static unsigned int rng_state = 2463534242u;
-static unsigned int xorshift(void) __attribute__((unused));
 static unsigned int xorshift(void) {
     rng_state ^= rng_state << 13;
     rng_state ^= rng_state >> 17;
@@ -64,6 +63,14 @@ static int cap_rate(double fse) {
     return 222;
 }
 
+/* 牛顿法 sqrt，避免 libm 依赖 */
+static double my_sqrt(double x) {
+    if (x <= 0.0) return 0.0;
+    double y = x;
+    for (int i = 0; i < 10; i++) y = 0.5 * (y + x / y);
+    return y;
+}
+
 /* ---------- 全局输入 ---------- */
 static int P, N, K, T, beamMax, M;
 static int ru[MAXM][12], ru_sz[MAXM];
@@ -76,6 +83,7 @@ static int res2sub[MAXK];
 
 static int is_su[MAXN + 1];      /* 1 = SU 独占用户 */
 static int mu_group[MAXN + 1];   /* MU 组 ID (0..M-1), -1 = 非 MU */
+static int groupKeep = 32;       /* 全量常驻剪枝 */
 
 static int pop_order[MAXP];      /* 波束按策略排序 */
 static double db_share[12];      /* lin2db(1/s), s=1..10 */
@@ -240,16 +248,87 @@ static double rate_of(int i, int t, int s) {
     return (double)cap_rate(sinr[i] + db_share[s] + G[i][t]);
 }
 
+/* ── 7950 simpleBeams 二维评分：per-(subband, beam) 独立打分 ── */
+static void simple_beams_2d(BeamConfig *cfg) {
+    struct { double score; int t; int p; } cands[MAXT * MAXP];
+    int nc = 0;
+    for (int t = 1; t <= T; t++) {
+        for (int p = 1; p <= P; p++) {
+            double score = 0.0;
+            for (int u = 1; u <= N; u++) {
+                if (buf[u] <= 0) continue;
+                double ratio = (Sall[u] > 1e-9) ? CAP[u][p] / Sall[u] : 0.0;
+                if (ratio <= 0.0) continue;
+                score += my_sqrt((double)buf[u]) * ratio * (double)rsub_sz[t];
+            }
+            cands[nc].score = score; cands[nc].t = t; cands[nc].p = p; nc++;
+        }
+    }
+    /* 按分降序 */
+    for (int a = 0; a < nc; a++)
+        for (int b = a + 1; b < nc; b++)
+            if (cands[b].score > cands[a].score) {
+                double ts = cands[a].score; cands[a].score = cands[b].score; cands[b].score = ts;
+                int tt = cands[a].t; cands[a].t = cands[b].t; cands[b].t = tt;
+                int tp = cands[a].p; cands[a].p = cands[b].p; cands[b].p = tp;
+            }
+    /* 取 top beamMax, 去重 per subband */
+    for (int t = 1; t <= T; t++) cfg->cnt[t] = 0;
+    int used_cnt = 0;
+    int used_tp[MAXT + 1][MAXP + 1];
+    memset(used_tp, 0, sizeof(used_tp));
+    for (int i = 0; i < nc && used_cnt < beamMax; i++) {
+        int t = cands[i].t, p = cands[i].p;
+        if (used_tp[t][p]) continue;
+        used_tp[t][p] = 1;
+        cfg->beams[t][cfg->cnt[t]++] = p;
+        used_cnt++;
+    }
+    /* 每子带内波束排序 */
+    for (int t = 1; t <= T; t++)
+        for (int a = 0; a < cfg->cnt[t]; a++)
+            for (int b = a + 1; b < cfg->cnt[t]; b++)
+                if (cfg->beams[t][b] < cfg->beams[t][a]) {
+                    int tmp = cfg->beams[t][a];
+                    cfg->beams[t][a] = cfg->beams[t][b];
+                    cfg->beams[t][b] = tmp;
+                }
+}
+
 /* ---------- 资源驱动贪心：单资源块的最佳配置 ---------- */
-static double best_config(int t, double *rem, int *chosen, double *cr, int *ncho) {
+static double best_config(int t, double *rem, int *chosen, double *cr, int *ncho, int groupKeep) {
     double bestv = -1.0; int bn = 0; int bu[12]; double bc[12];
 
-    /* 单用户 */
-    for (int i = 1; i <= N; i++) {
-        if (rem[i] <= 1e-9) continue;
-        double r = rate_of(i, t, 1);
-        double v = rem[i] < r ? rem[i] : r;
-        if (v > bestv) { bestv = v; bn = 1; bu[0] = i; bc[0] = r; }
+    /* 单用户: groupKeep 剪枝 — 仅评估期望速率最高的前 groupKeep 用户 */
+    if (groupKeep > 0 && groupKeep < N) {
+        struct { int u; double r; } cands[MAXN + 1];
+        int nc = 0;
+        for (int i = 1; i <= N; i++) {
+            if (rem[i] <= 1e-9) continue;
+            double r = rate_of(i, t, 1);
+            if (r > 0) { cands[nc].u = i; cands[nc].r = r; nc++; }
+        }
+        /* 选择排序取 top groupKeep */
+        int top = groupKeep < nc ? groupKeep : nc;
+        for (int a = 0; a < top; a++)
+            for (int b = a + 1; b < nc; b++)
+                if (cands[b].r > cands[a].r) {
+                    int tu = cands[a].u; cands[a].u = cands[b].u; cands[b].u = tu;
+                    double tr = cands[a].r; cands[a].r = cands[b].r; cands[b].r = tr;
+                }
+        for (int a = 0; a < top; a++) {
+            int i = cands[a].u;
+            double v = rem[i] < cands[a].r ? rem[i] : cands[a].r;
+            if (v > bestv) { bestv = v; bn = 1; bu[0] = i; bc[0] = cands[a].r; }
+        }
+    } else {
+        /* 全量单用户遍历 (小用例) */
+        for (int i = 1; i <= N; i++) {
+            if (rem[i] <= 1e-9) continue;
+            double r = rate_of(i, t, 1);
+            double v = rem[i] < r ? rem[i] : r;
+            if (v > bestv) { bestv = v; bn = 1; bu[0] = i; bc[0] = r; }
+        }
     }
 
     /* RU 内共享 */
@@ -317,7 +396,7 @@ static double evaluate_plan(const BeamConfig *cfg,
         for (int j = 0; j < rsub_sz[t]; j++) reslist[rcnt++] = rsub[t][j];
     for (int a = 0; a < rcnt; a++)
         for (int b = a + 1; b < rcnt; b++)
-            if (cfg->cnt[res2sub[reslist[b]]] > cfg->cnt[res2sub[reslist[a]]]) {
+            if (cfg->cnt[res2sub[reslist[b]]] < cfg->cnt[res2sub[reslist[a]]]) {  /* 升序: 贫瘠子带优先 */
                 int tmp = reslist[a]; reslist[a] = reslist[b]; reslist[b] = tmp;
             }
 
@@ -325,7 +404,7 @@ static double evaluate_plan(const BeamConfig *cfg,
         int res = reslist[a], t = res2sub[res];
         if (cfg->cnt[t] == 0) continue;
         int chosen[12]; double cr[12]; int nch;
-        double v = best_config(t, rem, chosen, cr, &nch);
+        double v = best_config(t, rem, chosen, cr, &nch, groupKeep);  /* groupKeep 读取全局 */
         if (nch > 0 && v > 1e-9) {
             for (int x = 0; x < nch; x++) {
                 int u = chosen[x];
@@ -565,6 +644,9 @@ int main(void) {
     db_share[1] = 0.0;
     for (int s = 2; s <= 10; s++) db_share[s] = lin2db(1.0 / s);
 
+    clock_t t_start = clock();
+    const double PHASE2_LIMIT = 0.070;  /* 单波束爬山 70ms 线 */
+
     /* 6 种波束策略 */
     void (*strategies[6])(void) = {compute_pop, compute_marginal, compute_balanced,
                                    compute_mupot, compute_mubeam, compute_suonly};
@@ -575,17 +657,14 @@ int main(void) {
     int best_al_res[MAXN + 1][MAXK];
     double bestT = -1.0;
 
-    /* Phase 1: 种子生成 + Phase 2: 沙盘评估 */
+    /* Phase 1: 6 策略种子扫描 */
     for (int s = 0; s < 6; s++) {
-        strategies[s]();  /* 设置 pop_order */
-
+        strategies[s]();
         BeamConfig cfg;
         int al_cnt[MAXN + 1];
         int al_sub[MAXN + 1][MAXK];
         int al_res[MAXN + 1][MAXK];
-
         double score = generate_seed(&cfg, al_cnt, al_sub, al_res);
-
         if (score > bestT) {
             bestT = score;
             best_cfg = cfg;
@@ -597,6 +676,85 @@ int main(void) {
                 }
             }
         }
+    }
+
+    /* Phase 2: Steepest Ascent — 大子带优先 + 遍历全P取最高峰 */
+    {
+        int t_order[MAXT];
+        for (int i = 0; i < T; i++) t_order[i] = i + 1;
+        for (int a = 0; a < T; a++)
+            for (int b = a + 1; b < T; b++)
+                if (rsub_sz[t_order[b]] > rsub_sz[t_order[a]]) {
+                    int tmp = t_order[a]; t_order[a] = t_order[b]; t_order[b] = tmp;
+                }
+
+        int improved = 1;
+        while (improved) {
+            improved = 0;
+            for (int idx = 0; idx < T; idx++) {
+                int t = t_order[idx];
+                if (best_cfg.cnt[t] == 0) continue;
+                if ((double)(clock() - t_start) / CLOCKS_PER_SEC > PHASE2_LIMIT) break;
+
+                for (int pos = 0; pos < best_cfg.cnt[t]; pos++) {
+                    int old_beam = best_cfg.beams[t][pos];
+                    int best_p = old_beam;
+                    double best_pos_score = bestT;
+                    for (int p = 1; p <= P; p++) {
+                        if (p == old_beam) continue;
+                        int dup = 0;
+                        for (int k = 0; k < best_cfg.cnt[t]; k++)
+                            if (best_cfg.beams[t][k] == p) { dup = 1; break; }
+                        if (dup) continue;
+                        best_cfg.beams[t][pos] = p;
+                        double cand_score = evaluate_plan(&best_cfg, NULL, NULL, NULL);
+                        if (cand_score > best_pos_score) {
+                            best_pos_score = cand_score; best_p = p;
+                        }
+                    }
+                    if (best_p != old_beam) {
+                        best_cfg.beams[t][pos] = best_p;
+                        bestT = best_pos_score;
+                        improved = 1;
+                    } else {
+                        best_cfg.beams[t][pos] = old_beam;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Phase 3: 贪心扩容 — 逐步挂载波束到 beamMax 或无增益 */
+    {
+        int total_beams = 0;
+        for (int t = 1; t <= T; t++) total_beams += best_cfg.cnt[t];
+        while (total_beams < beamMax) {
+            int best_t = -1, best_p = -1;
+            double best_gain = 0.0;
+            for (int t = 1; t <= T; t++) {
+                /* 时钟守卫下沉到子带循环: 82ms 熔断, 留18ms给输出 */
+                if ((double)(clock() - t_start) / CLOCKS_PER_SEC > 0.082) goto FINAL_OUTPUT;
+                if (best_cfg.cnt[t] >= P) continue;
+                for (int p = 1; p <= P; p++) {
+                    int dup = 0;
+                    for (int k = 0; k < best_cfg.cnt[t]; k++)
+                        if (best_cfg.beams[t][k] == p) { dup = 1; break; }
+                    if (dup) continue;
+                    best_cfg.beams[t][best_cfg.cnt[t]++] = p;
+                    double cand_score = evaluate_plan(&best_cfg, NULL, NULL, NULL);
+                    double gain = cand_score - bestT;
+                    best_cfg.cnt[t]--;
+                    if (gain > best_gain) { best_gain = gain; best_t = t; best_p = p; }
+                }
+            }
+            if (best_gain > 1e-9) {
+                best_cfg.beams[best_t][best_cfg.cnt[best_t]++] = best_p;
+                bestT += best_gain;
+                total_beams++;
+            } else break;
+        }
+        FINAL_OUTPUT:
+        bestT = evaluate_plan(&best_cfg, best_al_cnt, best_al_sub, best_al_res);
     }
 
     /* 输出：T 行子带波束 + N 行用户资源 */
